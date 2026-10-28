@@ -1,5 +1,12 @@
+import { randomUUID } from 'node:crypto';
 import { chromium } from 'playwright';
 import { validateUrl, isIpBlocked } from '../utils/urlValidator.js';
+import {
+  checkMetadata,
+  checkImages,
+  checkAccessibility,
+  checkSameOriginLinks,
+} from './qualityChecks.js';
 
 const DEFAULT_TIMEOUT_MS = 15000;
 const MAX_CONCURRENT_SCANS = parseInt(process.env.MAX_CONCURRENT_SCANS, 10) || 3;
@@ -92,23 +99,80 @@ function classifyNavigationError(error, timeoutMs) {
 }
 
 /**
+ * Computes finding totals grouped by severity and category.
+ *
+ * @param {object[]} findings
+ * @returns {{
+ *   totalFindings: number,
+ *   bySeverity: Record<string, number>,
+ *   byCategory: Record<string, number>
+ * }}
+ */
+function generateSummary(findings) {
+  const summary = {
+    totalFindings: findings.length,
+    bySeverity: {
+      critical: 0,
+      high: 0,
+      medium: 0,
+      low: 0,
+      info: 0,
+    },
+    byCategory: {
+      'page-load': 0,
+      'javascript-error': 0,
+      'console-error': 0,
+      'failed-request': 0,
+      'broken-link': 0,
+      'broken-image': 0,
+      'missing-metadata': 0,
+      accessibility: 0,
+    },
+  };
+
+  for (const f of findings) {
+    if (summary.bySeverity[f.severity] !== undefined) {
+      summary.bySeverity[f.severity]++;
+    } else {
+      summary.bySeverity[f.severity] = 1;
+    }
+
+    if (summary.byCategory[f.category] !== undefined) {
+      summary.byCategory[f.category]++;
+    } else {
+      summary.byCategory[f.category] = 1;
+    }
+  }
+
+  return summary;
+}
+
+/**
  * Scans a target URL using an isolated Playwright Chromium instance with
- * strict SSRF protections, CDP-level request interception, and resource limits.
+ * strict SSRF protections, CDP-level request interception, and real quality checks.
  *
  * @param {string} targetUrl
  * @param {object} [options]
  * @param {number} [options.timeoutMs]
  * @param {boolean} [options.allowLocalForTesting] - Internal testing only
+ * @param {number} [options.maxLinks]
+ * @param {number} [options.linkTimeoutMs]
  * @returns {Promise<{
  *   url: string,
  *   finalUrl: string,
  *   title: string,
  *   httpStatus: number,
  *   headingCount: number,
- *   loadTimeMs: number
+ *   loadTimeMs: number,
+ *   scanDurationMs: number,
+ *   summary: object,
+ *   checks: object,
+ *   findings: object[]
  * }>}
  */
 export async function scanWebsite(targetUrl, options = {}) {
+  const scanStartTime = Date.now();
+
   // 1. Initial URL and DNS validation
   const validation = await validateUrl(targetUrl, {
     allowLoopback: options.allowLocalForTesting === true,
@@ -141,7 +205,6 @@ export async function scanWebsite(targetUrl, options = {}) {
 
   try {
     // 3. Launch isolated Chromium browser
-    // Host resolver rules pin the target domain to the validated IP and block local/metadata resolutions
     const resolverRules = [
       `MAP ${validation.hostname} ${validation.primaryIp}`,
       options.allowLocalForTesting ? '' : 'MAP 127.0.0.1 ~NOTFOUND',
@@ -185,7 +248,7 @@ export async function scanWebsite(targetUrl, options = {}) {
 
     const page = await context.newPage();
 
-    // 5. Intercept all requests & redirects via CDP to prevent SSRF and unvalidated redirects
+    // 5. Intercept all requests & redirects via CDP to prevent SSRF
     cdp = await context.newCDPSession(page);
     await cdp.send('Fetch.enable', {
       patterns: [{ urlPattern: '*' }],
@@ -194,7 +257,6 @@ export async function scanWebsite(targetUrl, options = {}) {
     cdp.on('Fetch.requestPaused', async (event) => {
       const { requestId, request } = event;
       try {
-        // Enforce strict public validation on all subsequent requests and redirects
         const reqValidation = await validateUrl(request.url, {
           allowLoopback: options.allowLocalForTesting && request.url.startsWith(validation.url),
         });
@@ -216,8 +278,67 @@ export async function scanWebsite(targetUrl, options = {}) {
       }
     });
 
-    // 6. Navigate to target URL
-    const startTime = Date.now();
+    // 6. Register listeners for page errors, console messages, and network failures
+    const jsErrors = [];
+    const consoleErrors = [];
+    const failedRequests = [];
+    const seenFailedUrls = new Set();
+
+    page.on('pageerror', (err) => {
+      jsErrors.push({
+        message: err.message || 'Unknown runtime error',
+        name: err.name || 'Error',
+      });
+    });
+
+    page.on('console', (msg) => {
+      if (msg.type() === 'error') {
+        consoleErrors.push({
+          text: msg.text(),
+          location: msg.location(),
+        });
+      }
+    });
+
+    page.on('requestfailed', (req) => {
+      const failure = req.failure();
+      const errorText = failure ? failure.errorText : 'Request failed';
+      // Ignore normal page cancellations on unload
+      if (errorText === 'net::ERR_ABORTED') return;
+      const url = req.url();
+      if (!seenFailedUrls.has(url)) {
+        seenFailedUrls.add(url);
+        failedRequests.push({
+          url,
+          method: req.method(),
+          resourceType: req.resourceType(),
+          errorText,
+        });
+      }
+    });
+
+    page.on('response', (res) => {
+      const req = res.request();
+      if (req.isNavigationRequest() && req.frame() === page.mainFrame()) {
+        return;
+      }
+      const status = res.status();
+      if (status >= 400) {
+        const url = res.url();
+        if (!seenFailedUrls.has(url)) {
+          seenFailedUrls.add(url);
+          failedRequests.push({
+            url,
+            method: req.method(),
+            resourceType: req.resourceType(),
+            statusCode: status,
+          });
+        }
+      }
+    });
+
+    // 7. Navigate to target URL
+    const navStartTime = Date.now();
     let response = null;
 
     try {
@@ -229,9 +350,9 @@ export async function scanWebsite(targetUrl, options = {}) {
       throw classifyNavigationError(navError, timeoutMs);
     }
 
-    const loadTimeMs = Date.now() - startTime;
+    const loadTimeMs = Date.now() - navStartTime;
 
-    // 7. Verify response destination IP address
+    // 8. Verify remote address
     if (response) {
       const serverAddr = await response.serverAddr().catch(() => null);
       if (serverAddr && serverAddr.ipAddress) {
@@ -248,13 +369,150 @@ export async function scanWebsite(targetUrl, options = {}) {
       }
     }
 
-    // 8. Extract page metadata
+    // 9. Collect basic page metrics
     const finalUrl = page.url();
     const title = (await page.title().catch(() => '')) || '';
     const httpStatus = response ? response.status() : 200;
     const headingCount = await page
       .$$eval('h1, h2, h3, h4, h5, h6', (headings) => headings.length)
       .catch(() => 0);
+
+    // 10. Assemble findings and check statuses
+    const findings = [];
+    const checks = {};
+
+    // Page Load check
+    checks.pageLoad = {
+      status: httpStatus >= 400 ? 'issues_found' : 'passed',
+      httpStatus,
+      durationMs: loadTimeMs,
+    };
+
+    if (httpStatus >= 400) {
+      findings.push({
+        id: randomUUID(),
+        category: 'page-load',
+        severity: httpStatus >= 500 ? 'critical' : 'high',
+        title: `Target website returned HTTP ${httpStatus}`,
+        message: `The server responded with an error HTTP status code (${httpStatus}).`,
+        url: finalUrl,
+        evidence: { httpStatus },
+      });
+    }
+
+    // JavaScript runtime errors
+    for (const err of jsErrors) {
+      findings.push({
+        id: randomUUID(),
+        category: 'javascript-error',
+        severity: 'high',
+        title: 'Uncaught JavaScript runtime error',
+        message: err.message,
+        evidence: { name: err.name, message: err.message },
+      });
+    }
+    checks.javascriptErrors = {
+      status: jsErrors.length > 0 ? 'issues_found' : 'passed',
+      issuesCount: jsErrors.length,
+    };
+
+    // Console errors
+    for (const cErr of consoleErrors) {
+      findings.push({
+        id: randomUUID(),
+        category: 'console-error',
+        severity: 'medium',
+        title: 'Browser console error',
+        message: cErr.text,
+        evidence: { text: cErr.text, location: cErr.location },
+      });
+    }
+    checks.consoleErrors = {
+      status: consoleErrors.length > 0 ? 'issues_found' : 'passed',
+      issuesCount: consoleErrors.length,
+    };
+
+    // Failed network requests
+    for (const fReq of failedRequests) {
+      findings.push({
+        id: randomUUID(),
+        category: 'failed-request',
+        severity: 'medium',
+        title: 'Network request failed',
+        message: fReq.statusCode
+          ? `Subresource returned HTTP ${fReq.statusCode}`
+          : `Network request failed: ${fReq.errorText}`,
+        url: fReq.url,
+        evidence: {
+          url: fReq.url,
+          method: fReq.method,
+          resourceType: fReq.resourceType,
+          statusCode: fReq.statusCode,
+          errorText: fReq.errorText,
+        },
+      });
+    }
+    checks.networkRequests = {
+      status: failedRequests.length > 0 ? 'issues_found' : 'passed',
+      issuesCount: failedRequests.length,
+    };
+
+    // Page metadata checks (title, meta description, H1)
+    try {
+      const metaResult = await checkMetadata(page);
+      findings.push(...metaResult.findings);
+      checks.pageMetadata = {
+        status: metaResult.findings.length > 0 ? 'issues_found' : 'passed',
+        issuesCount: metaResult.findings.length,
+      };
+    } catch (err) {
+      checks.pageMetadata = { status: 'failed', error: err.message };
+    }
+
+    // Broken image checks
+    try {
+      const imgResult = await checkImages(page);
+      findings.push(...imgResult.findings);
+      checks.brokenImages = {
+        status: imgResult.brokenCount > 0 ? 'issues_found' : 'passed',
+        totalChecked: imgResult.totalChecked,
+        issuesCount: imgResult.brokenCount,
+      };
+    } catch (err) {
+      checks.brokenImages = { status: 'failed', error: err.message };
+    }
+
+    // Accessibility baseline checks (alt attributes & form labels)
+    try {
+      const a11yResult = await checkAccessibility(page);
+      findings.push(...a11yResult.findings);
+      checks.accessibility = {
+        status: a11yResult.issuesCount > 0 ? 'issues_found' : 'passed',
+        issuesCount: a11yResult.issuesCount,
+      };
+    } catch (err) {
+      checks.accessibility = { status: 'failed', error: err.message };
+    }
+
+    // Same-origin broken link checks
+    try {
+      const linkResult = await checkSameOriginLinks(page, finalUrl, {
+        allowLocalForTesting: options.allowLocalForTesting,
+        maxLinks: options.maxLinks,
+        timeoutMs: options.linkTimeoutMs,
+      });
+      findings.push(...linkResult.findings);
+      checks.brokenLinks = {
+        status: linkResult.brokenCount > 0 ? 'issues_found' : 'passed',
+        totalFound: linkResult.totalFound,
+        totalChecked: linkResult.totalChecked,
+        issuesCount: linkResult.brokenCount,
+      };
+    } catch (err) {
+      checks.brokenLinks = { status: 'failed', error: err.message };
+    }
+
+    const scanDurationMs = Date.now() - scanStartTime;
 
     return {
       url: targetUrl,
@@ -263,9 +521,13 @@ export async function scanWebsite(targetUrl, options = {}) {
       httpStatus,
       headingCount,
       loadTimeMs,
+      scanDurationMs,
+      summary: generateSummary(findings),
+      checks,
+      findings,
     };
   } finally {
-    // 9. Clean up all resources
+    // 11. Resource cleanup
     if (cdp) {
       await cdp.detach().catch(() => {});
     }
