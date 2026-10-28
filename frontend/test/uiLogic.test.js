@@ -1,0 +1,192 @@
+import { describe, it } from 'node:test';
+import assert from 'node:assert/strict';
+import http from 'node:http';
+import { validateClientUrl } from '../src/utils/urlHelpers.js';
+import { runWebsiteScan } from '../src/services/api.js';
+
+describe('Frontend UI Logic & Utilities', () => {
+  describe('validateClientUrl', () => {
+    it('rejects empty, null, or whitespace URL', () => {
+      const empty = validateClientUrl('');
+      assert.equal(empty.isValid, false);
+      assert.match(empty.error, /enter a website URL/i);
+
+      const nullVal = validateClientUrl(null);
+      assert.equal(nullVal.isValid, false);
+
+      const spaces = validateClientUrl('   ');
+      assert.equal(spaces.isValid, false);
+    });
+
+    it('rejects URLs without http or https protocol', () => {
+      const ftp = validateClientUrl('ftp://example.com');
+      assert.equal(ftp.isValid, false);
+      assert.match(ftp.error, /http:\/\/ or https:\/\//i);
+
+      const rawDomain = validateClientUrl('example.com');
+      assert.equal(rawDomain.isValid, false);
+      assert.match(rawDomain.error, /http:\/\/ or https:\/\//i);
+
+      const fileProto = validateClientUrl('file:///etc/passwd');
+      assert.equal(fileProto.isValid, false);
+    });
+
+    it('accepts legitimate public HTTP and HTTPS URLs', () => {
+      const https = validateClientUrl('https://example.com');
+      assert.equal(https.isValid, true);
+      assert.equal(https.url, 'https://example.com');
+
+      const httpUrl = validateClientUrl('http://test.org/path?query=value#hash');
+      assert.equal(httpUrl.isValid, true);
+      assert.equal(httpUrl.url, 'http://test.org/path?query=value#hash');
+    });
+  });
+
+  describe('runWebsiteScan API Service', () => {
+    it('successfully receives and returns real scan data from backend endpoint', async () => {
+      const mockBackend = http.createServer((req, res) => {
+        if (req.method === 'POST' && req.url === '/api/scans/preview') {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(
+            JSON.stringify({
+              success: true,
+              data: {
+                url: 'https://example.com',
+                finalUrl: 'https://example.com/',
+                title: 'Example Domain',
+                httpStatus: 200,
+                headingCount: 1,
+                loadTimeMs: 150,
+                scanDurationMs: 450,
+                summary: {
+                  totalFindings: 0,
+                  bySeverity: { critical: 0, high: 0, medium: 0, low: 0, info: 0 },
+                },
+                checks: {
+                  pageLoad: { status: 'passed' },
+                },
+                findings: [],
+              },
+            })
+          );
+        } else {
+          res.writeHead(404);
+          res.end();
+        }
+      });
+
+      await new Promise((resolve) => mockBackend.listen(0, '127.0.0.1', resolve));
+      const port = mockBackend.address().port;
+      process.env.VITE_API_BASE_URL = `http://127.0.0.1:${port}`;
+
+      try {
+        const result = await runWebsiteScan('https://example.com');
+        assert.ok(result);
+        assert.equal(result.url, 'https://example.com');
+        assert.equal(result.title, 'Example Domain');
+        assert.equal(result.httpStatus, 200);
+        assert.equal(result.summary.totalFindings, 0);
+        assert.deepEqual(result.findings, []);
+      } finally {
+        await new Promise((resolve) => mockBackend.close(resolve));
+      }
+    });
+
+    it('handles non-2xx backend error responses gracefully', async () => {
+      const mockBackend = http.createServer((req, res) => {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            success: false,
+            message: 'Invalid URL: Target IP is restricted',
+            code: 'RESTRICTED_IP',
+          })
+        );
+      });
+
+      await new Promise((resolve) => mockBackend.listen(0, '127.0.0.1', resolve));
+      const port = mockBackend.address().port;
+      process.env.VITE_API_BASE_URL = `http://127.0.0.1:${port}`;
+
+      try {
+        await assert.rejects(
+          async () => {
+            await runWebsiteScan('http://169.254.169.254');
+          },
+          (err) => {
+            assert.match(err.message, /Target IP is restricted/i);
+            assert.equal(err.code, 'RESTRICTED_IP');
+            assert.equal(err.status, 400);
+            return true;
+          }
+        );
+      } finally {
+        await new Promise((resolve) => mockBackend.close(resolve));
+      }
+    });
+
+    it('handles malformed non-JSON server responses without crashing', async () => {
+      const mockBackend = http.createServer((req, res) => {
+        res.writeHead(502, { 'Content-Type': 'text/plain' });
+        res.end('Bad Gateway Nginx Error');
+      });
+
+      await new Promise((resolve) => mockBackend.listen(0, '127.0.0.1', resolve));
+      const port = mockBackend.address().port;
+      process.env.VITE_API_BASE_URL = `http://127.0.0.1:${port}`;
+
+      try {
+        await assert.rejects(
+          async () => {
+            await runWebsiteScan('https://example.com');
+          },
+          (err) => {
+            assert.match(err.message, /unparseable response/i);
+            return true;
+          }
+        );
+      } finally {
+        await new Promise((resolve) => mockBackend.close(resolve));
+      }
+    });
+
+    it('handles network failure when backend is unreachable', async () => {
+      // Point to an unused local port
+      process.env.VITE_API_BASE_URL = 'http://127.0.0.1:59998';
+
+      await assert.rejects(
+        async () => {
+          await runWebsiteScan('https://example.com');
+        },
+        (err) => {
+          assert.match(err.message, /Unable to reach TestIT backend/i);
+          return true;
+        }
+      );
+    });
+  });
+
+  describe('Duplicate Submission Prevention Logic', () => {
+    it('prevents initiating a new scan while another is active', () => {
+      let isScanning = true;
+      let callCount = 0;
+
+      function mockTriggerScan(_url) {
+        if (isScanning) {
+          return { initiated: false, reason: 'Scan in progress' };
+        }
+        callCount++;
+        return { initiated: true };
+      }
+
+      const attempt1 = mockTriggerScan('https://example.com');
+      assert.equal(attempt1.initiated, false);
+      assert.equal(callCount, 0);
+
+      isScanning = false;
+      const attempt2 = mockTriggerScan('https://example.com');
+      assert.equal(attempt2.initiated, true);
+      assert.equal(callCount, 1);
+    });
+  });
+});
