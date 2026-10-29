@@ -2,7 +2,12 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { validateClientUrl } from '../src/utils/urlHelpers.js';
-import { runWebsiteScan } from '../src/services/api.js';
+import {
+  runWebsiteScan,
+  getFunctionalTestSchema,
+  validateFunctionalTest,
+  executeFunctionalTest,
+} from '../src/services/api.js';
 
 describe('Frontend UI Logic & Utilities', () => {
   describe('validateClientUrl', () => {
@@ -187,6 +192,160 @@ describe('Frontend UI Logic & Utilities', () => {
       const attempt2 = mockTriggerScan('https://example.com');
       assert.equal(attempt2.initiated, true);
       assert.equal(callCount, 1);
+    });
+  });
+
+  describe('Functional Test API Client Methods', () => {
+    it('getFunctionalTestSchema retrieves supported actions and sample test', async () => {
+      const mockBackend = http.createServer((req, res) => {
+        if (req.method === 'GET' && req.url === '/api/functional-tests/schema') {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(
+            JSON.stringify({
+              success: true,
+              data: {
+                supportedActions: ['navigate', 'click', 'fill', 'assertVisible'],
+                supportedStrategies: ['role', 'label', 'placeholder', 'text', 'css'],
+                sampleTest: { name: 'Sample' },
+              },
+            })
+          );
+        } else {
+          res.writeHead(404);
+          res.end();
+        }
+      });
+
+      await new Promise((resolve) => mockBackend.listen(0, '127.0.0.1', resolve));
+      const port = mockBackend.address().port;
+      process.env.VITE_API_BASE_URL = `http://127.0.0.1:${port}`;
+
+      try {
+        const schema = await getFunctionalTestSchema();
+        assert.ok(schema);
+        assert.deepEqual(schema.supportedActions, ['navigate', 'click', 'fill', 'assertVisible']);
+        assert.equal(schema.sampleTest.name, 'Sample');
+      } finally {
+        await new Promise((resolve) => mockBackend.close(resolve));
+      }
+    });
+
+    it('validateFunctionalTest returns validation results from backend', async () => {
+      const mockBackend = http.createServer((req, res) => {
+        if (req.method === 'POST' && req.url === '/api/functional-tests/validate') {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(
+            JSON.stringify({
+              success: true,
+              valid: true,
+              normalizedDefinition: { name: 'Valid Test' },
+            })
+          );
+        } else {
+          res.writeHead(404);
+          res.end();
+        }
+      });
+
+      await new Promise((resolve) => mockBackend.listen(0, '127.0.0.1', resolve));
+      const port = mockBackend.address().port;
+      process.env.VITE_API_BASE_URL = `http://127.0.0.1:${port}`;
+
+      try {
+        const result = await validateFunctionalTest({ name: 'Valid Test' });
+        assert.equal(result.valid, true);
+        assert.equal(result.normalizedDefinition.name, 'Valid Test');
+      } finally {
+        await new Promise((resolve) => mockBackend.close(resolve));
+      }
+    });
+
+    it('executeFunctionalTest executes test and returns full structured execution report', async () => {
+      const mockReport = {
+        testName: 'Search Medicine Flow',
+        status: 'passed',
+        totalSteps: 2,
+        executedSteps: 2,
+        passedSteps: 2,
+        failedSteps: 0,
+        steps: [
+          {
+            stepIndex: 1,
+            action: 'navigate',
+            description: 'Navigate to site',
+            status: 'passed',
+            durationMs: 320,
+            expected: 'Navigate to https://example.com',
+            actual: 'Landed on https://example.com',
+          },
+          {
+            stepIndex: 2,
+            action: 'assertVisible',
+            description: 'Check search bar',
+            status: 'passed',
+            durationMs: 80,
+            expected: 'Search input is visible',
+            actual: 'Element is visible',
+          },
+        ],
+      };
+
+      const mockBackend = http.createServer((req, res) => {
+        if (req.method === 'POST' && req.url === '/api/functional-tests/execute') {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: true, data: mockReport }));
+        } else {
+          res.writeHead(404);
+          res.end();
+        }
+      });
+
+      await new Promise((resolve) => mockBackend.listen(0, '127.0.0.1', resolve));
+      const port = mockBackend.address().port;
+      process.env.VITE_API_BASE_URL = `http://127.0.0.1:${port}`;
+
+      try {
+        const report = await executeFunctionalTest({ name: 'Search Medicine Flow' });
+        assert.ok(report);
+        assert.equal(report.testName, 'Search Medicine Flow');
+        assert.equal(report.status, 'passed');
+        assert.equal(report.totalSteps, 2);
+        assert.equal(report.steps[0].action, 'navigate');
+      } finally {
+        await new Promise((resolve) => mockBackend.close(resolve));
+      }
+    });
+
+    it('executeFunctionalTest rejects when backend reports validation errors', async () => {
+      const mockBackend = http.createServer((req, res) => {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            success: false,
+            message: 'Invalid test definition',
+            errors: ['Test name is required.', 'Step 1 target is missing.'],
+          })
+        );
+      });
+
+      await new Promise((resolve) => mockBackend.listen(0, '127.0.0.1', resolve));
+      const port = mockBackend.address().port;
+      process.env.VITE_API_BASE_URL = `http://127.0.0.1:${port}`;
+
+      try {
+        await assert.rejects(
+          async () => {
+            await executeFunctionalTest({});
+          },
+          (err) => {
+            assert.match(err.message, /Test name is required/i);
+            assert.equal(err.status, 400);
+            return true;
+          }
+        );
+      } finally {
+        await new Promise((resolve) => mockBackend.close(resolve));
+      }
     });
   });
 });

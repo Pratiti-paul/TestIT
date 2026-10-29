@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import healthRoutes from './routes/healthRoutes.js';
 import scanRoutes from './routes/scanRoutes.js';
+import functionalTestRoutes from './routes/functionalTestRoutes.js';
 
 const app = express();
 
@@ -26,11 +27,12 @@ app.use(
 );
 
 // Enforce request body size limits
-app.use(express.json({ limit: '10kb' }));
+app.use(express.json({ limit: '100kb' }));
 
 // API Routes
 app.use('/api/health', healthRoutes);
 app.use('/api/scans', scanRoutes);
+app.use('/api/functional-tests', functionalTestRoutes);
 
 // JSON 404 handler for unknown routes
 app.use((req, res, next) => {
