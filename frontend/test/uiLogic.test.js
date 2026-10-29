@@ -7,6 +7,7 @@ import {
   getFunctionalTestSchema,
   validateFunctionalTest,
   executeFunctionalTest,
+  executeAiTest,
 } from '../src/services/api.js';
 
 describe('Frontend UI Logic & Utilities', () => {
@@ -340,6 +341,91 @@ describe('Frontend UI Logic & Utilities', () => {
           (err) => {
             assert.match(err.message, /Test name is required/i);
             assert.equal(err.status, 400);
+            return true;
+          }
+        );
+      } finally {
+        await new Promise((resolve) => mockBackend.close(resolve));
+      }
+    });
+  });
+
+  describe('executeAiTest API Service', () => {
+    it('successfully posts url and instructions to /api/ai-tests/run and returns report', async () => {
+      const mockReport = {
+        testName: 'AI Test: Paracetamol Search',
+        status: 'passed',
+        objective: 'Search for Paracetamol and verify results',
+        planner: { mode: 'deterministic_fallback', aiConfigured: false },
+        totalSteps: 3,
+        executedSteps: 3,
+        passedSteps: 3,
+        failedSteps: 0,
+        steps: [
+          {
+            stepIndex: 1,
+            action: 'navigate',
+            status: 'passed',
+            expected: 'Navigate to site',
+            actual: 'Landed on site',
+          },
+        ],
+      };
+
+      const mockBackend = http.createServer((req, res) => {
+        if (req.method === 'POST' && req.url === '/api/ai-tests/run') {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: true, data: mockReport }));
+        } else {
+          res.writeHead(404);
+          res.end();
+        }
+      });
+
+      await new Promise((resolve) => mockBackend.listen(0, '127.0.0.1', resolve));
+      const port = mockBackend.address().port;
+      process.env.VITE_API_BASE_URL = `http://127.0.0.1:${port}`;
+
+      try {
+        const report = await executeAiTest({
+          url: 'https://example.com',
+          instructions: 'Search for Paracetamol',
+        });
+
+        assert.ok(report);
+        assert.equal(report.status, 'passed');
+        assert.equal(report.objective, 'Search for Paracetamol and verify results');
+        assert.equal(report.totalSteps, 3);
+      } finally {
+        await new Promise((resolve) => mockBackend.close(resolve));
+      }
+    });
+
+    it('rejects gracefully when backend returns HTTP error', async () => {
+      const mockBackend = http.createServer((req, res) => {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            success: false,
+            message: 'Testing instructions are required',
+            code: 'MISSING_INSTRUCTIONS',
+          })
+        );
+      });
+
+      await new Promise((resolve) => mockBackend.listen(0, '127.0.0.1', resolve));
+      const port = mockBackend.address().port;
+      process.env.VITE_API_BASE_URL = `http://127.0.0.1:${port}`;
+
+      try {
+        await assert.rejects(
+          async () => {
+            await executeAiTest({ url: 'https://example.com', instructions: '' });
+          },
+          (err) => {
+            assert.match(err.message, /instructions are required/i);
+            assert.equal(err.status, 400);
+            assert.equal(err.code, 'MISSING_INSTRUCTIONS');
             return true;
           }
         );

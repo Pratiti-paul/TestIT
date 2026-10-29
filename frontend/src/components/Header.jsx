@@ -9,7 +9,7 @@ export function Header() {
         </div>
         <div className="brand-text">
           <span className="brand-name">TestIT</span>
-          <span className="brand-tagline">Automated Website Quality & Security Testing</span>
+          <span className="brand-tagline">AI-Driven Website Quality & User-Flow Testing</span>
         </div>
       </div>
     </header>

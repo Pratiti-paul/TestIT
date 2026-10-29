@@ -3,6 +3,7 @@ import cors from 'cors';
 import healthRoutes from './routes/healthRoutes.js';
 import scanRoutes from './routes/scanRoutes.js';
 import functionalTestRoutes from './routes/functionalTestRoutes.js';
+import aiTestRoutes from './routes/aiTestRoutes.js';
 
 const app = express();
 
@@ -33,6 +34,7 @@ app.use(express.json({ limit: '100kb' }));
 app.use('/api/health', healthRoutes);
 app.use('/api/scans', scanRoutes);
 app.use('/api/functional-tests', functionalTestRoutes);
+app.use('/api/ai-tests', aiTestRoutes);
 
 // JSON 404 handler for unknown routes
 app.use((req, res, next) => {

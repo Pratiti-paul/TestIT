@@ -148,3 +148,54 @@ export async function executeFunctionalTest(definition, signal) {
 
   return data.data;
 }
+
+/**
+ * Executes an AI-driven website test:
+ * Sends the URL, natural-language instructions, and optional test credentials to the backend.
+ *
+ * @param {object} payload
+ * @param {string} payload.url - Target website URL
+ * @param {string} payload.instructions - Natural-language testing instructions
+ * @param {object} [payload.credentials] - Optional test credentials { username, password }
+ * @param {boolean} [payload.authorized] - User confirmation of test authorization
+ * @param {AbortSignal} [signal] - Optional abort signal
+ * @returns {Promise<object>} Complete AI test report
+ */
+export async function executeAiTest(payload, signal) {
+  const baseUrl = getApiBaseUrl();
+  const endpoint = `${baseUrl}/api/ai-tests/run`;
+
+  let response;
+  try {
+    response = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal,
+    });
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      throw new Error('AI test execution was canceled.');
+    }
+    throw new Error(
+      `Unable to reach TestIT backend at ${baseUrl}. Ensure the backend server is running.`
+    );
+  }
+
+  let data;
+  try {
+    data = await response.json();
+  } catch {
+    throw new Error(`Server returned an unparseable response (HTTP ${response.status}).`);
+  }
+
+  if (!response.ok || !data.success) {
+    const message = data?.message || `AI test failed with status ${response.status}`;
+    const error = new Error(message);
+    error.status = response.status;
+    error.code = data?.code || 'AI_TEST_ERROR';
+    throw error;
+  }
+
+  return data.data;
+}

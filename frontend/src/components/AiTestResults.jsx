@@ -9,29 +9,34 @@ import {
   Maximize2,
   ChevronDown,
   ChevronUp,
+  Cpu,
+  Lock,
+  ShieldAlert,
 } from 'lucide-react';
 
 /**
- * FunctionalTestResults
+ * AiTestResults
  *
- * Renders the full execution report of a multi-step user-flow test:
- * - Overall status banner (PASSED vs FAILED)
- * - Metric summary cards (Total steps, Passed, Failed, Duration)
- * - Failure alert box (if applicable)
- * - Detailed step-by-step timeline cards with expected vs actual outcomes
- * - Inline screenshot view / expander for evidence captures
- *
- * @param {object} props
- * @param {object} props.result - Execution report returned by functional test runner
+ * Renders the complete AI test report:
+ * - Overall status banner (PASSED / FAILED / PARTIAL / BLOCKED)
+ * - AI Planner metadata & clear deterministic fallback indicator
+ * - Blocked / Prerequisite requirements banner
+ * - Metrics summary cards and live page diagnostics
+ * - Step-by-step execution timeline with expected vs actual outcomes
+ * - Evidence screenshots and enlarged modal preview
  */
-export function FunctionalTestResults({ result }) {
+export function AiTestResults({ report }) {
   const [expandedScreenshots, setExpandedScreenshots] = useState({});
   const [modalImage, setModalImage] = useState(null);
 
-  if (!result) return null;
+  if (!report) return null;
 
-  const isPassed = result.status === 'passed';
-  const durationSec = ((result.durationMs || 0) / 1000).toFixed(2);
+  const isPassed = report.status === 'passed';
+  const isBlocked = report.status === 'blocked';
+  const isPartial = report.status === 'partial';
+  const isFailed = report.status === 'failed';
+
+  const durationSec = ((report.durationMs || 0) / 1000).toFixed(2);
 
   const toggleScreenshot = (stepIndex) => {
     setExpandedScreenshots((prev) => ({
@@ -41,28 +46,38 @@ export function FunctionalTestResults({ result }) {
   };
 
   return (
-    <section className="functional-results-section" aria-labelledby="results-heading">
+    <section className="functional-results-section" aria-labelledby="ai-results-heading">
       {/* 1. Overall Status Banner */}
       <div
-        className={`test-status-banner ${isPassed ? 'status-banner-passed' : 'status-banner-failed'}`}
+        className={`test-status-banner ${
+          isPassed
+            ? 'status-banner-passed'
+            : isBlocked
+            ? 'status-banner-blocked'
+            : isPartial
+            ? 'status-banner-partial'
+            : 'status-banner-failed'
+        }`}
         role="status"
         aria-live="polite"
       >
         <div className="banner-left">
           <div className="status-icon-wrapper">
-            {isPassed ? (
-              <CheckCircle2 size={36} className="icon-passed" aria-hidden="true" />
-            ) : (
-              <XCircle size={36} className="icon-failed" aria-hidden="true" />
-            )}
+            {isPassed && <CheckCircle2 size={38} className="icon-passed" aria-hidden="true" />}
+            {isFailed && <XCircle size={38} className="icon-failed" aria-hidden="true" />}
+            {isPartial && <AlertTriangle size={38} className="icon-partial" aria-hidden="true" />}
+            {isBlocked && <ShieldAlert size={38} className="icon-blocked" aria-hidden="true" />}
           </div>
           <div className="status-text-content">
-            <span className="status-label-eyebrow">Functional Flow Status</span>
-            <h2 id="results-heading" className="status-title">
-              {isPassed ? 'Test Passed Successfully' : 'Test Flow Failed'}
+            <span className="status-label-eyebrow">AI QA Test Outcome</span>
+            <h2 id="ai-results-heading" className="status-title">
+              {isPassed && 'Test Passed Successfully'}
+              {isFailed && 'Test Verification Failed'}
+              {isPartial && 'Partial Test Journey Completed'}
+              {isBlocked && 'Test Execution Blocked'}
             </h2>
             <p className="status-subtitle">
-              {result.testName} &mdash; {result.description || 'Custom multi-step user flow'}
+              {report.objective || report.testName || 'AI Website Test'}
             </p>
           </div>
         </div>
@@ -70,69 +85,114 @@ export function FunctionalTestResults({ result }) {
         <div className="banner-meta">
           <span className="banner-duration">
             <Clock size={16} aria-hidden="true" />
-            <span>{durationSec}s total duration</span>
+            <span>{durationSec}s duration</span>
           </span>
-          <span className="banner-url" title={result.finalUrl || result.startUrl}>
+          <span className="banner-url" title={report.finalUrl || report.startUrl}>
             <Globe size={16} aria-hidden="true" />
-            <span>{result.finalUrl || result.startUrl}</span>
+            <span>{report.finalUrl || report.startUrl}</span>
           </span>
         </div>
       </div>
 
-      {/* 2. Metrics Summary Grid */}
-      <div className="test-metrics-grid">
-        <div className="metric-card">
-          <span className="metric-label">Total Steps</span>
-          <strong className="metric-value">{result.totalSteps || 0}</strong>
-          <span className="metric-caption">{result.executedSteps || 0} executed</span>
+      {/* 2. AI Planner Attribution Card */}
+      {report.planner && (
+        <div
+          className={`planner-attribution-card ${
+            report.planner.aiConfigured ? 'planner-ai-live' : 'planner-fallback-active'
+          }`}
+        >
+          <div className="planner-card-header">
+            <Cpu size={18} aria-hidden="true" />
+            <strong>
+              {report.planner.aiConfigured
+                ? `AI Planner: ${report.planner.provider?.toUpperCase()} (${report.planner.model || 'live'})`
+                : 'Deterministic Fallback Planner'}
+            </strong>
+            <span className="planner-badge">
+              {report.planner.aiConfigured ? 'LLM Synthesized' : 'Rule-Based Engine'}
+            </span>
+          </div>
+          <p className="planner-notice-text">{report.planner.notice}</p>
         </div>
+      )}
 
-        <div className="metric-card metric-card-passed">
-          <span className="metric-label">Passed Steps</span>
-          <strong className="metric-value metric-value-passed">{result.passedSteps || 0}</strong>
-          <span className="metric-caption">Successful assertions</span>
+      {/* 3. Blocked Policy / Prerequisite Alert */}
+      {isBlocked && (
+        <div className="failure-alert-box blocked-alert-box" role="alert">
+          <div className="failure-box-header">
+            <Lock size={20} className="icon-alert" aria-hidden="true" />
+            <h3>Test Execution Blocked</h3>
+          </div>
+          <p className="failure-message">{report.blockedReason}</p>
+          {Array.isArray(report.missingCredentials) && report.missingCredentials.length > 0 && (
+            <p className="missing-creds-tip">
+              Required prerequisites: <strong>{report.missingCredentials.join(', ')}</strong>.
+              Provide test credentials in the form above to enable authenticated testing.
+            </p>
+          )}
         </div>
+      )}
 
-        <div className="metric-card metric-card-failed">
-          <span className="metric-label">Failed / Errors</span>
-          <strong className="metric-value metric-value-failed">{result.failedSteps || 0}</strong>
-          <span className="metric-caption">
-            {result.failedSteps === 0 ? 'No issues encountered' : 'Halted execution'}
-          </span>
-        </div>
-
-        <div className="metric-card">
-          <span className="metric-label">Execution Time</span>
-          <strong className="metric-value">{result.durationMs || 0} ms</strong>
-          <span className="metric-caption">Browser wall time</span>
-        </div>
-      </div>
-
-      {/* 3. Failure Detail Box (if test failed) */}
-      {!isPassed && result.failure && (
+      {/* 4. Failure Detail Box */}
+      {isFailed && report.failure && (
         <div className="failure-alert-box" role="alert">
           <div className="failure-box-header">
             <AlertTriangle size={20} className="icon-alert" aria-hidden="true" />
             <h3>
-              Failure at Step {result.failure.stepIndex}: {result.failure.action}
+              Verification Failed at Step {report.failure.stepIndex} ({report.failure.action})
             </h3>
           </div>
-          <p className="failure-message">{result.failure.message}</p>
+          <p className="failure-message">{report.failure.message}</p>
         </div>
       )}
 
-      {/* 4. Step-by-Step Execution Timeline */}
-      <div className="steps-results-container">
-        <div className="steps-results-header">
-          <h3>Step-by-Step Execution Timeline</h3>
-          <span className="steps-count-badge">
-            {result.executedSteps || 0} of {result.totalSteps || 0} Steps
+      {/* 5. Metrics & Page Diagnostics Grid */}
+      <div className="test-metrics-grid">
+        <div className="metric-card">
+          <span className="metric-label">Total Steps</span>
+          <strong className="metric-value">{report.totalSteps || 0}</strong>
+          <span className="metric-caption">{report.executedSteps || 0} executed</span>
+        </div>
+
+        <div className="metric-card metric-card-passed">
+          <span className="metric-label">Passed Steps</span>
+          <strong className="metric-value metric-value-passed">{report.passedSteps || 0}</strong>
+          <span className="metric-caption">Verified assertions</span>
+        </div>
+
+        <div className="metric-card metric-card-failed">
+          <span className="metric-label">Failed Steps</span>
+          <strong className="metric-value metric-value-failed">{report.failedSteps || 0}</strong>
+          <span className="metric-caption">
+            {report.failedSteps === 0 ? 'No failures' : 'Caused test halt'}
           </span>
         </div>
 
-        <div className="step-cards-list">
-          {Array.isArray(result.steps) &&
-            result.steps.map((step) => {
+        <div className="metric-card">
+          <span className="metric-label">Page Status</span>
+          <strong className="metric-value">
+            {report.pageDiagnostics?.httpStatus || (isBlocked ? 'N/A' : 200)}
+          </strong>
+          <span className="metric-caption">
+            {report.pageDiagnostics?.loadTimeMs
+              ? `${report.pageDiagnostics.loadTimeMs}ms load time`
+              : 'HTTP Response'}
+          </span>
+        </div>
+      </div>
+
+      {/* 6. Step-by-Step Execution Timeline */}
+      {Array.isArray(report.steps) && report.steps.length > 0 && (
+        <div className="steps-results-container">
+          <div className="steps-results-header">
+            <h3>Verified Browser Interactions ({report.steps.length})</h3>
+            <span className="steps-count-badge">
+              {report.executedSteps || 0} of {report.totalSteps || 0} Steps Executed
+            </span>
+          </div>
+
+          <div className="step-cards-list">
+            {report.steps.map((step) => {
               const stepPassed = step.status === 'passed';
               const hasScreenshot = Boolean(step.screenshot);
               const isExpanded = Boolean(expandedScreenshots[step.stepIndex]);
@@ -169,7 +229,7 @@ export function FunctionalTestResults({ result }) {
                         ) : (
                           <>
                             <XCircle size={14} aria-hidden="true" />
-                            <span>{step.status === 'error' ? 'ERROR' : 'FAILED'}</span>
+                            <span>FAILED</span>
                           </>
                         )}
                       </span>
@@ -201,7 +261,9 @@ export function FunctionalTestResults({ result }) {
                         aria-expanded={isExpanded}
                       >
                         <Camera size={15} aria-hidden="true" />
-                        <span>{isExpanded ? 'Hide Evidence Screenshot' : 'View Evidence Screenshot'}</span>
+                        <span>
+                          {isExpanded ? 'Hide Evidence Screenshot' : 'View Evidence Screenshot'}
+                        </span>
                         {isExpanded ? <ChevronUp size={15} /> : <ChevronDown size={15} />}
                       </button>
 
@@ -229,8 +291,9 @@ export function FunctionalTestResults({ result }) {
                 </article>
               );
             })}
+          </div>
         </div>
-      </div>
+      )}
 
       {/* Lightbox / Modal for enlarged screenshot */}
       {modalImage && (
