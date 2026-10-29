@@ -10,7 +10,11 @@ export const ALLOWED_ACTIONS = [
   'assertUrl',
   'assertCount',
   'assertInvalidLogin',
+  'assertAuthenticatedState',
   'ensureLoginPage',
+  'ensureSearchPage',
+  'resetAuthSession',
+  'assertDateSync',
   'screenshot',
 ];
 
@@ -255,7 +259,10 @@ export async function validateTestDefinition(definition, options = {}) {
         }
 
         case 'assertInvalidLogin':
+        case 'assertAuthenticatedState':
         case 'ensureLoginPage':
+        case 'ensureSearchPage':
+        case 'assertDateSync':
         case 'screenshot':
           // Optional target or metadata
           break;

@@ -1,6 +1,8 @@
 import { chromium } from 'playwright';
 import { validateUrl } from '../utils/urlValidator.js';
 import { resolveLocator } from './functionalTestRunner.js';
+import { verifyAuthenticationSuccess } from './verifiers/authVerifier.js';
+import { discoverWebsite, navigateToDiscoveredCapability } from './websiteDiscoveryService.js';
 
 const MAX_CONCURRENT_TESTS = parseInt(process.env.MAX_CONCURRENT_SCANS, 10) || 3;
 let activeTests = 0;
@@ -141,7 +143,7 @@ export async function inspectPageType(page) {
  * @param {number} timeout
  * @returns {Promise<{ expected: string, actual: string }>}
  */
-export async function ensureLoginPage(page, step, timeout) {
+export async function ensureLoginPage(page, step, timeout, discoveryResult = null) {
   const currentUrl = page.url();
   const info = await inspectPageType(page);
 
@@ -153,7 +155,24 @@ export async function ensureLoginPage(page, step, timeout) {
     };
   }
 
-  // 2. Discover login navigation link / button
+  // 2. Check if website discovery located a dedicated login page
+  if (discoveryResult?.loginPageUrl && discoveryResult.loginPageUrl !== currentUrl) {
+    try {
+      await page.goto(discoveryResult.loginPageUrl, { waitUntil: 'domcontentloaded', timeout: Math.min(timeout, 5000) });
+      await page.waitForTimeout(400);
+      const postInfo = await inspectPageType(page);
+      if (postInfo.isLoginPage || postInfo.hasLoginFormControls) {
+        return {
+          expected: step.expected || 'Navigate to login page',
+          actual: `Navigated to discovered login interface (${page.url()})`,
+        };
+      }
+    } catch {
+      // Continue to in-page link discovery
+    }
+  }
+
+  // 3. Discover login navigation link / button
   const loginLinkSelectors = [
     'a:has-text("Already have an account")',
     'a:has-text("Log in")',
@@ -310,6 +329,180 @@ export async function assertInvalidLogin(page, step, timeout) {
 }
 
 /**
+ * Ensures the browser has navigated to an interface containing an active search field.
+ * If search is already available on the page, passes immediately.
+ * If on an unauthenticated login page and search requires login, halts with BLOCKED.
+ * If on a general landing/home page, discovers and follows catalog/products navigation links.
+ *
+ * @param {import('playwright').Page} page
+ * @param {object} step
+ * @param {number} timeout
+ * @returns {Promise<{ expected: string, actual: string }>}
+ */
+export async function ensureSearchPage(page, step, timeout, discoveryResult = null) {
+  const currentUrl = page.url();
+
+  // 1. Check if search input is already visible and enabled on current page
+  const searchInputSelectors = [
+    '.medicine-search-input',
+    'input[placeholder*="search" i]',
+    'input[type="search"]',
+    '[role="searchbox"]',
+    'input[name="search" i]',
+    'input[name="q" i]',
+    '[data-testid*="search" i]',
+  ];
+
+  for (const sel of searchInputSelectors) {
+    const loc = page.locator(sel).first();
+    const isVis = await loc.isVisible({ timeout: 400 }).catch(() => false);
+    if (isVis) {
+      return {
+        expected: step.expected || 'Ensure active page provides a search field',
+        actual: `Current page (${currentUrl}) already provides an active search field`,
+      };
+    }
+  }
+
+  // 2. Check if website discovery already located a search or catalog page
+  const targetUrl = discoveryResult?.searchPageUrl || discoveryResult?.catalogPageUrl;
+  if (targetUrl && targetUrl !== currentUrl) {
+    try {
+      await page.goto(targetUrl, {
+        waitUntil: 'domcontentloaded',
+        timeout: Math.min(timeout, 5000),
+      });
+      await page.waitForTimeout(400);
+
+      for (const sel of searchInputSelectors) {
+        const loc = page.locator(sel).first();
+        const isVis = await loc.isVisible({ timeout: 1500 }).catch(() => false);
+        if (isVis) {
+          return {
+            expected: step.expected || 'Navigate to search interface',
+            actual: `Navigated to discovered search interface (${page.url()})`,
+          };
+        }
+      }
+    } catch {
+      // Continue to in-page link discovery
+    }
+  }
+
+  // 2. If on login page (e.g. from prior login test step), attempt navigating back to startUrl/homepage
+  const info = await inspectPageType(page);
+  if (info.isLoginPage) {
+    const fallbackTarget = step.startUrl;
+    if (fallbackTarget && fallbackTarget !== currentUrl) {
+      try {
+        await page.goto(fallbackTarget, { timeout: Math.min(timeout, 5000), waitUntil: 'domcontentloaded' });
+        await page.waitForTimeout(500);
+      } catch {
+        // Fallback to in-page logo/home link
+        const logoLink = page.locator('a[href="/"], a.navbar-brand, a:has-text("Medico"), a:has-text("Home")').first();
+        if (await logoLink.isVisible({ timeout: 500 }).catch(() => false)) {
+          await logoLink.click().catch(() => {});
+          await page.waitForTimeout(500);
+        }
+      }
+    } else {
+      const logoLink = page.locator('a[href="/"], a.navbar-brand, a:has-text("Medico"), a:has-text("Home")').first();
+      if (await logoLink.isVisible({ timeout: 500 }).catch(() => false)) {
+        await logoLink.click().catch(() => {});
+        await page.waitForTimeout(500);
+      }
+    }
+
+    // Check if landing page directly provides a search input
+    for (const sel of searchInputSelectors) {
+      const loc = page.locator(sel).first();
+      const isVis = await loc.isVisible({ timeout: 600 }).catch(() => false);
+      if (isVis) {
+        return {
+          expected: step.expected || 'Ensure active page provides a search field',
+          actual: `Returned from login to public page (${page.url()}) which provides an active search field`,
+        };
+      }
+    }
+
+    // If still stuck on login after navigation attempt, then search truly requires authentication
+    const postNavInfo = await inspectPageType(page);
+    if (postNavInfo.isLoginPage) {
+      const err = new Error(
+        `Unable to locate search field: Browser is currently on the unauthenticated Login page (${page.url()}). The website requires authentication to reach the product catalog. Please supply valid test credentials to test authenticated features.`
+      );
+      err.statusType = 'BLOCKED';
+      throw err;
+    }
+  }
+
+  // 3. Search not present on current page: discover catalog navigation links
+  const catalogNavSelectors = [
+    'a:has-text("Medicine")',
+    'a:has-text("Medicines")',
+    'a:has-text("Products")',
+    'a:has-text("Shop")',
+    'a:has-text("Catalog")',
+    'a:has-text("Store")',
+    'a:has-text("Pharmacy")',
+    'a[href*="medicine" i]',
+    'a[href*="product" i]',
+    'a[href*="catalog" i]',
+    'a[href*="shop" i]',
+    'a[href*="store" i]',
+    'button:has-text("Medicine")',
+    'button:has-text("Products")',
+    'button:has-text("Shop")',
+  ];
+
+  let clickedNav = null;
+  for (const sel of catalogNavSelectors) {
+    const loc = page.locator(sel).first();
+    const isVis = await loc.isVisible({ timeout: 400 }).catch(() => false);
+    if (isVis) {
+      clickedNav = loc;
+      break;
+    }
+  }
+
+  if (clickedNav) {
+    const prevUrl = page.url();
+    await clickedNav.click({ timeout: Math.min(timeout, 4000) });
+    await page.waitForLoadState('domcontentloaded', { timeout: Math.min(timeout, 5000) }).catch(() => {});
+    await page.waitForTimeout(600);
+
+    // Verify search input is now present on the navigated page
+    for (const sel of searchInputSelectors) {
+      const loc = page.locator(sel).first();
+      const isVis = await loc.isVisible({ timeout: 2000 }).catch(() => false);
+      if (isVis) {
+        return {
+          expected: step.expected || 'Navigate to catalog or search interface',
+          actual: `Discovered catalog navigation link and navigated from ${prevUrl} to search page (${page.url()})`,
+        };
+      }
+    }
+
+    const postUrl = page.url();
+    const postInfo = await inspectPageType(page);
+    if (postInfo.isLoginPage) {
+      const err = new Error(
+        `Navigation to catalog from ${prevUrl} redirected to Login page (${postUrl}) because the catalog requires an authenticated session. Please supply valid test credentials.`
+      );
+      err.statusType = 'BLOCKED';
+      throw err;
+    }
+  }
+
+  // If we could not find catalog link or search field
+  const err = new Error(
+    `Unable to locate search field or catalog navigation link on ${currentUrl}. The page does not present a visible search input or recognizable catalog link.`
+  );
+  err.statusType = 'BLOCKED';
+  throw err;
+}
+
+/**
  * Attempts to resolve an element using the primary target and any fallback strategies.
  *
  * @param {import('playwright').Page} page
@@ -354,7 +547,7 @@ async function smartFindElement(page, step, timeout) {
  * @param {number} defaultTimeoutMs
  * @returns {Promise<{ expected: string, actual: string, screenshot?: string }>}
  */
-async function executeAiStep(page, step, defaultTimeoutMs) {
+async function executeAiStep(page, step, defaultTimeoutMs, discoveryResult = null, startUrl = '') {
   const timeout = step.timeoutMs || defaultTimeoutMs;
 
   switch (step.action) {
@@ -367,12 +560,55 @@ async function executeAiStep(page, step, defaultTimeoutMs) {
       };
     }
 
+    case 'resetAuthSession': {
+      await page.evaluate(() => {
+        try {
+          localStorage.clear();
+          sessionStorage.clear();
+        } catch {}
+      }).catch(() => {});
+      const inputs = page.locator('input[type="text"], input[type="email"], input[type="password"]');
+      const count = await inputs.count().catch(() => 0);
+      for (let k = 0; k < count; k++) {
+        await inputs.nth(k).fill('').catch(() => {});
+      }
+      await page.waitForTimeout(300);
+      return {
+        expected: step.expected || 'Establish fresh session for authentication',
+        actual: 'Session storage cleared and form reset for fresh authentication attempt',
+      };
+    }
+
     case 'ensureLoginPage': {
-      return await ensureLoginPage(page, step, timeout);
+      return await ensureLoginPage(page, step, timeout, discoveryResult);
+    }
+
+    case 'ensureSearchPage': {
+      return await ensureSearchPage(page, step, timeout, discoveryResult);
     }
 
     case 'assertInvalidLogin': {
       return await assertInvalidLogin(page, step, timeout);
+    }
+
+    case 'assertAuthenticatedState': {
+      const outcome = await verifyAuthenticationSuccess(page, {
+        submittedUsername: step.submittedUsername,
+        preLoginUrl: step.preLoginUrl || step.startUrl || startUrl,
+        timeout,
+      });
+
+      if (!outcome.pass) {
+        const err = new Error(outcome.actual);
+        err.statusType = outcome.status || 'FAIL';
+        err.signals = outcome.signals;
+        throw err;
+      }
+
+      return {
+        expected: step.expected || outcome.expected,
+        actual: outcome.actual,
+      };
     }
 
     case 'click': {
@@ -423,10 +659,17 @@ async function executeAiStep(page, step, defaultTimeoutMs) {
     case 'fill': {
       const locator = await smartFindElement(page, step, timeout);
       await locator.fill(String(step.value), { timeout });
+
+      // If filling a search query or marked as isSearch, trigger search submit via Enter
+      if (step.isSearch === true) {
+        await locator.press('Enter').catch(() => {});
+        await page.waitForTimeout(400);
+      }
+
       const displayVal = step.isSensitive ? '••••••••' : String(step.value);
       return {
         expected: step.expected || `Fill input with "${displayVal}"`,
-        actual: `Input filled with "${displayVal}"`,
+        actual: `Input filled with "${displayVal}"${step.isSearch ? ' and search submitted' : ''}`,
       };
     }
 
@@ -507,6 +750,91 @@ async function executeAiStep(page, step, defaultTimeoutMs) {
       return {
         expected: step.expected || `Found ${expectedCount} elements`,
         actual: `Observed ${count} elements`,
+      };
+    }
+
+    case 'assertDateSync': {
+      const today = new Date();
+      const daysShort = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+      const daysFull = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+      const currentDayShort = daysShort[today.getDay()];
+      const currentDayFull = daysFull[today.getDay()];
+      const currentDateNum = today.getDate();
+      const currentMonthShort = today.toLocaleString('en-US', { month: 'short' });
+      const currentYear = today.getFullYear();
+
+      // Look for active day / date selectors across standard UI patterns
+      const activeSelectors = [
+        'button.bg-primary',
+        'button[aria-selected="true"]',
+        'button.active',
+        '[aria-current="date"]',
+        '.active-day',
+        '[class*="active"][class*="day"]',
+        '[class*="selected"][class*="day"]',
+      ];
+
+      let identifiedDay = null;
+      let syncPassed = false;
+      let matchedSource = '';
+
+      for (const selector of activeSelectors) {
+        const locator = page.locator(selector);
+        const count = await locator.count().catch(() => 0);
+        if (count > 0) {
+          for (let i = 0; i < count; i++) {
+            const el = locator.nth(i);
+            const text = ((await el.innerText().catch(() => '')) || '').trim();
+            const firstLine = text.split('\n')[0].trim();
+            if (firstLine) {
+              for (const day of [currentDayShort, currentDayFull]) {
+                if (firstLine.toLowerCase().includes(day.toLowerCase())) {
+                  identifiedDay = firstLine;
+                  syncPassed = true;
+                  matchedSource = `active control ("${selector}") displaying "${firstLine}"`;
+                  break;
+                }
+              }
+              if (syncPassed) break;
+              if (!identifiedDay) identifiedDay = firstLine;
+            }
+          }
+          if (syncPassed) break;
+        }
+      }
+
+      // If not found in active button styling, scan page text for today's day/date
+      if (!syncPassed) {
+        const bodyText = await page.innerText('body').catch(() => '');
+        const hasTodayText = bodyText.includes('Today');
+        const hasCurrentDay =
+          bodyText.toLowerCase().includes(currentDayShort.toLowerCase()) ||
+          bodyText.toLowerCase().includes(currentDayFull.toLowerCase());
+
+        if (hasTodayText && hasCurrentDay) {
+          syncPassed = true;
+          identifiedDay = `Today (${currentDayShort})`;
+          matchedSource = `page content containing "Today" and current day "${currentDayShort}"`;
+        } else if (hasCurrentDay) {
+          syncPassed = true;
+          identifiedDay = currentDayShort;
+          matchedSource = `page schedule containing current day "${currentDayShort}"`;
+        }
+      }
+
+      if (!syncPassed) {
+        const err = new Error(
+          `Date synchronization failed: Expected page to highlight or display current day "${currentDayFull}" (${currentDayShort}, ${currentMonthShort} ${currentDateNum}), but found "${identifiedDay || 'no active day indicator'}".`
+        );
+        err.statusType = 'FAIL';
+        throw err;
+      }
+
+      return {
+        expected:
+          step.expected ||
+          `Page active day/date is synchronized with current day (${currentDayFull} / ${currentDayShort})`,
+        actual: `Identified ${matchedSource}, correctly synchronized with system date (${currentDayFull}, ${currentMonthShort} ${currentDateNum}, ${currentYear})`,
       };
     }
 
@@ -676,6 +1004,20 @@ export async function runAiTest(plan, startUrl, options = {}) {
       loadTimeMs: pageLoadTimeMs,
     };
 
+    // Execute dynamic, bounded website discovery to map pages, navigation, and controls
+    let discoveryResult = null;
+    try {
+      const priorityKeywords = (plan.objective || '').split(/\s+/).filter((w) => w.length > 3);
+      discoveryResult = await discoverWebsite(page, startUrl, {
+        allowLocalForTesting: options.allowLocalForTesting === true,
+        maxPages: 4,
+        timeoutMs: 4000,
+        priorityKeywords,
+      });
+    } catch {
+      // Non-fatal if discovery encounters an issue on simple local fixtures
+    }
+
     const stepResults = [];
     let overallStatus = plan.status === 'partial' ? 'partial' : 'passed';
     let failureDetail = null;
@@ -686,7 +1028,7 @@ export async function runAiTest(plan, startUrl, options = {}) {
       const stepStartTime = Date.now();
 
       try {
-        const outcome = await executeAiStep(page, step, stepTimeoutMs);
+        const outcome = await executeAiStep(page, step, stepTimeoutMs, discoveryResult, startUrl);
         const durationMs = Date.now() - stepStartTime;
 
         stepResults.push({
@@ -744,12 +1086,20 @@ export async function runAiTest(plan, startUrl, options = {}) {
           // Ignore screenshot error
         }
 
+        const failedUrl = page.url();
+        const failedTitle = await page.title().catch(() => '');
+        const failedPageInfo = await inspectPageType(page).catch(() => ({}));
+
         failureDetail = {
           stepIndex,
           stepId: step.id || `step-${stepIndex}`,
           action: step.action,
           status: stepStatus,
           message: stepErr.message,
+          currentUrl: failedUrl,
+          pageTitle: failedTitle,
+          isLoginPage: failedPageInfo.isLoginPage || false,
+          isSignupPage: failedPageInfo.isSignupPage || false,
         };
 
         const prefix =
@@ -767,7 +1117,67 @@ export async function runAiTest(plan, startUrl, options = {}) {
           screenshot: failScreenshot,
         });
 
-        // Record all subsequent dependent steps as SKIPPED
+        // Determine whether subsequent steps are strictly dependent on this step or flow
+        const failedFlowId = step.flowId;
+        const isAuthGateFailure =
+          step.isAuthGate === true ||
+          step.action === 'assertAuthenticatedState' ||
+          failedFlowId === 'auth';
+
+        // Check if there are independent steps remaining that can still be executed
+        let hasIndependentSteps = false;
+        if (isAuthGateFailure) {
+          for (let k = i + 1; k < plan.steps.length; k++) {
+            const candidate = plan.steps[k];
+            if (candidate.requiresAuth === false || (candidate.flowId && candidate.flowId !== 'auth')) {
+              hasIndependentSteps = true;
+              break;
+            }
+          }
+        }
+
+        if (hasIndependentSteps) {
+          // Skip only steps that depend on auth or on this failed flow
+          let nextRunnableIndex = -1;
+          for (let j = i + 1; j < plan.steps.length; j++) {
+            const depStep = plan.steps[j];
+            const isDependent =
+              depStep.requiresAuth === true ||
+              depStep.flowId === failedFlowId ||
+              depStep.dependsOn === step.id;
+
+            if (isDependent) {
+              stepResults.push({
+                stepIndex: j + 1,
+                id: depStep.id || `step-${j + 1}`,
+                action: depStep.action,
+                description: depStep.description || `${depStep.action} action`,
+                status: 'SKIPPED',
+                durationMs: 0,
+                expected: depStep.expected || `Step ${depStep.action} executes after prerequisites pass`,
+                actual: `Skipped: Dependent on unfulfilled Step ${stepIndex} (${step.action}: ${stepStatus})`,
+                screenshot: null,
+              });
+            } else {
+              nextRunnableIndex = j;
+              break;
+            }
+          }
+
+          if (nextRunnableIndex !== -1) {
+            // Attempt recovery to public starting point before running next independent flow
+            try {
+              await page.goto(startUrl, { waitUntil: 'domcontentloaded', timeout: 5000 });
+              await page.waitForTimeout(400);
+            } catch {
+              // Ignore navigation recovery error
+            }
+            i = nextRunnableIndex - 1; // outer loop increment will advance to nextRunnableIndex
+            continue;
+          }
+        }
+
+        // If no independent steps remain or this was an unrecoverable failure, skip all remaining steps and break
         for (let j = i + 1; j < plan.steps.length; j++) {
           const depStep = plan.steps[j];
           stepResults.push({
@@ -783,7 +1193,7 @@ export async function runAiTest(plan, startUrl, options = {}) {
           });
         }
 
-        // Halt on step failure/block/error
+        // Halt execution after skipping dependent steps
         break;
       }
     }
@@ -818,6 +1228,13 @@ export async function runAiTest(plan, startUrl, options = {}) {
       steps: stepResults,
       failure: failureDetail,
       pageDiagnostics,
+      discovery: discoveryResult
+        ? {
+            pagesFound: discoveryResult.totalPagesExplored,
+            searchUrl: discoveryResult.searchPageUrl,
+            loginUrl: discoveryResult.loginPageUrl,
+          }
+        : null,
     };
   } finally {
     if (cdp) {

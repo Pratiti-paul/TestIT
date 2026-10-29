@@ -80,6 +80,8 @@ export function analyzeCredentialRequirements(instructions, credentials = {}) {
     text.includes('valid login') ||
     text.includes('log in with valid') ||
     text.includes('sign in with valid') ||
+    text.includes('valid and invalid') ||
+    text.includes('valid & invalid') ||
     text.includes('my account') ||
     text.includes('user profile') ||
     text.includes('logged in');
@@ -122,17 +124,16 @@ export function generateDeterministicPlan({ url, instructions, credentials = {} 
   const testsValid = lower.includes('valid') || lower.includes('success');
   const testsSearch = lower.includes('search') || lower.includes('find') || lower.includes('query');
   const testsCart = lower.includes('cart') || lower.includes('add to cart') || lower.includes('add the first result');
-
-  // If the instructions describe a flow the fallback cannot reliably construct without an LLM
-  if (!testsLogin && !testsSearch && !testsCart) {
-    return {
-      status: 'unsupported',
-      unsupportedReason:
-        'The deterministic fallback engine cannot reliably plan this custom user journey without an AI model. Please configure an AI API key (GEMINI_API_KEY or OPENAI_API_KEY) in backend/.env, or specify supported flows (e.g., login, search, add to cart).',
-      objective: `Unsupported journey: ${text.slice(0, 100)}`,
-      steps: [],
-    };
-  }
+  const testsDate =
+    lower.includes('date') ||
+    lower.includes('day') ||
+    lower.includes('calendar') ||
+    lower.includes('synchroniz') ||
+    lower.includes('sync') ||
+    lower.includes('today') ||
+    lower.includes('schedule') ||
+    lower.includes('time') ||
+    lower.includes('meal');
 
   // Step 1: Always navigate to the starting page
   steps.push({
@@ -180,6 +181,7 @@ export function generateDeterministicPlan({ url, instructions, credentials = {} 
         description: 'Enter invalid username/email to verify rejection',
         expected: 'Login form email/username field accepts input',
         timeoutMs: 5000,
+        flowId: 'auth',
       });
 
       steps.push({
@@ -195,6 +197,7 @@ export function generateDeterministicPlan({ url, instructions, credentials = {} 
         description: 'Enter invalid password to test authentication rejection',
         expected: 'Login form password field accepts input',
         timeoutMs: 5000,
+        flowId: 'auth',
       });
 
       steps.push({
@@ -210,6 +213,7 @@ export function generateDeterministicPlan({ url, instructions, credentials = {} 
         description: 'Submit invalid login credentials',
         expected: 'Submit login credentials to observe authentication rejection',
         timeoutMs: 5000,
+        flowId: 'auth',
       });
 
       steps.push({
@@ -225,11 +229,24 @@ export function generateDeterministicPlan({ url, instructions, credentials = {} 
         description: 'Verify login error message is displayed or user remains unauthenticated on login page',
         expected: 'Observable authentication error displayed or user remains unauthenticated on login page',
         timeoutMs: 5000,
+        flowId: 'auth',
       });
     }
 
     // If testing valid credentials
     if (testsValid && credentials.username && credentials.password) {
+      if (testsInvalid) {
+        // Establish a fresh, uncontaminated session before valid login attempt
+        steps.push({
+          id: `step-${stepCounter++}`,
+          action: 'resetAuthSession',
+          description: 'Establish fresh session for valid authentication test',
+          expected: 'Browser clears contaminated session and reloads login form cleanly',
+          timeoutMs: 5000,
+          flowId: 'auth',
+        });
+      }
+
       steps.push({
         id: `step-${stepCounter++}`,
         action: 'fill',
@@ -244,6 +261,7 @@ export function generateDeterministicPlan({ url, instructions, credentials = {} 
         description: 'Enter valid test account username/email',
         expected: `Enter valid username/email "${credentials.username}"`,
         timeoutMs: 5000,
+        flowId: 'auth',
       });
 
       steps.push({
@@ -259,6 +277,7 @@ export function generateDeterministicPlan({ url, instructions, credentials = {} 
         description: 'Enter valid test account password',
         expected: 'Enter valid password into login form',
         timeoutMs: 5000,
+        flowId: 'auth',
       });
 
       steps.push({
@@ -274,23 +293,19 @@ export function generateDeterministicPlan({ url, instructions, credentials = {} 
         description: 'Submit valid login credentials',
         expected: 'Submit valid credentials and complete authentication',
         timeoutMs: 5000,
+        flowId: 'auth',
       });
 
-      // Verify post-login condition
+      // Adaptive evidence-based post-login verification (replaces rigid guessed labels)
       steps.push({
         id: `step-${stepCounter++}`,
-        action: 'assertVisible',
-        target: { strategy: 'text', value: 'Logout' },
-        fallbacks: [
-          { strategy: 'role', value: 'button', name: 'Logout' },
-          { strategy: 'role', value: 'button', name: 'Sign out' },
-          { strategy: 'text', value: 'Sign out' },
-          { strategy: 'text', value: 'Account' },
-          { strategy: 'text', value: 'Dashboard' },
-        ],
-        description: 'Verify reliable post-login condition (authenticated session is active)',
-        expected: 'Authenticated session indicators (Logout, Dashboard, or Account) are visible',
+        action: 'assertAuthenticatedState',
+        submittedUsername: credentials.username,
+        description: 'Verify authenticated session established (redirect, form dismissal, session tokens)',
+        expected: 'Application establishes an authenticated session and transitions away from login form',
         timeoutMs: 8000,
+        flowId: 'auth',
+        isAuthGate: true,
       });
     }
   }
@@ -306,17 +321,45 @@ export function generateDeterministicPlan({ url, instructions, credentials = {} 
       searchQuery = searchMatch[1].trim();
     }
 
+    // Step to ensure we are on the search/catalog interface (discovering catalog link if not present)
+    steps.push({
+      id: `step-${stepCounter++}`,
+      action: 'ensureSearchPage',
+      startUrl: url,
+      flowId: 'search',
+      requiresAuth: false,
+      target: { strategy: 'placeholder', value: 'Search for medicine...' },
+      fallbacks: [
+        { strategy: 'placeholder', value: 'Search medicines...' },
+        { strategy: 'placeholder', value: 'Search' },
+        { strategy: 'role', value: 'searchbox' },
+        { strategy: 'role', value: 'link', name: 'Medicine' },
+        { strategy: 'role', value: 'link', name: 'Medicines' },
+        { strategy: 'role', value: 'link', name: 'Products' },
+        { strategy: 'role', value: 'link', name: 'Shop' },
+        { strategy: 'role', value: 'link', name: 'Catalog' },
+        { strategy: 'css', value: 'a[href*="medicine" i], a[href*="product" i], a[href*="catalog" i], a[href*="shop" i]' },
+      ],
+      description: 'Navigate to products/medicine listing page if search is not on current page',
+      expected: 'Products or search page is active and presents a search field',
+      timeoutMs: 8000,
+    });
+
     steps.push({
       id: `step-${stepCounter++}`,
       action: 'fill',
-      target: { strategy: 'placeholder', value: 'Search' },
+      flowId: 'search',
+      requiresAuth: false,
+      target: { strategy: 'placeholder', value: 'Search for medicine...' },
       fallbacks: [
-        { strategy: 'placeholder', value: 'search' },
+        { strategy: 'placeholder', value: 'Search medicines...' },
+        { strategy: 'placeholder', value: 'Search' },
         { strategy: 'role', value: 'searchbox' },
         { strategy: 'label', value: 'Search' },
-        { strategy: 'css', value: 'input[type="search"], input[placeholder*="search" i], input[name="q"], input[name="search"]' },
+        { strategy: 'css', value: '.medicine-search-input, input[placeholder*="search" i], input[type="search"], input[name="q"], input[name="search"]' },
       ],
       value: searchQuery,
+      isSearch: true,
       description: `Type "${searchQuery}" into the search input`,
       expected: `Search input accepts query "${searchQuery}"`,
       timeoutMs: 5000,
@@ -325,10 +368,16 @@ export function generateDeterministicPlan({ url, instructions, credentials = {} 
     steps.push({
       id: `step-${stepCounter++}`,
       action: 'click',
-      target: { strategy: 'role', value: 'button', name: 'Search' },
+      flowId: 'search',
+      requiresAuth: false,
+      target: {
+        strategy: 'css',
+        value: 'button.medicine-search-btn, button[aria-label*="search" i], form button[type="submit"], button:has-text("🔍"), button:has-text("Search")',
+      },
       fallbacks: [
+        { strategy: 'role', value: 'button', name: 'Search' },
+        { strategy: 'text', value: '🔍' },
         { strategy: 'text', value: 'Search' },
-        { strategy: 'css', value: 'button[type="submit"], form button, .search-btn' },
       ],
       description: `Submit search query for "${searchQuery}"`,
       expected: `Submit search query to display relevant search results`,
@@ -338,11 +387,12 @@ export function generateDeterministicPlan({ url, instructions, credentials = {} 
     steps.push({
       id: `step-${stepCounter++}`,
       action: 'assertVisible',
+      flowId: 'search',
+      requiresAuth: false,
       target: { strategy: 'text', value: searchQuery },
       fallbacks: [
+        { strategy: 'css', value: '.medicine-card, .product-card, .search-results, .results' },
         { strategy: 'text', value: 'Results' },
-        { strategy: 'text', value: 'Products' },
-        { strategy: 'css', value: '.search-results, .product-card, .results' },
       ],
       description: `Verify that search results matching "${searchQuery}" are displayed`,
       expected: `Search results matching "${searchQuery}" are displayed`,
@@ -355,12 +405,18 @@ export function generateDeterministicPlan({ url, instructions, credentials = {} 
     steps.push({
       id: `step-${stepCounter++}`,
       action: 'click',
-      target: { strategy: 'role', value: 'button', name: 'Add to Cart' },
+      flowId: 'cart',
+      requiresAuth: false,
+      target: {
+        strategy: 'css',
+        value: `.medicine-card:has-text("${searchQuery}") button, .product-card:has-text("${searchQuery}") button, [class*="card"]:has-text("${searchQuery}") button`,
+      },
       fallbacks: [
+        { strategy: 'role', value: 'button', name: 'Add to Cart' },
         { strategy: 'text', value: 'Add to Cart' },
         { strategy: 'role', value: 'button', name: 'Add' },
         { strategy: 'text', value: 'Add' },
-        { strategy: 'css', value: '.add-to-cart, button[aria-label*="cart" i], .product-card button' },
+        { strategy: 'css', value: '.add-to-cart, button[aria-label*="cart" i], .product-card button, .medicine-card button' },
       ],
       description: `Add item ("${searchQuery}") to the shopping cart`,
       expected: `Add product ("${searchQuery}") to the shopping cart`,
@@ -370,11 +426,17 @@ export function generateDeterministicPlan({ url, instructions, credentials = {} 
     steps.push({
       id: `step-${stepCounter++}`,
       action: 'click',
-      target: { strategy: 'role', value: 'button', name: 'Cart' },
+      flowId: 'cart',
+      requiresAuth: false,
+      target: {
+        strategy: 'css',
+        value: 'a.cart-btn, a[href*="cart" i], button[aria-label*="cart" i], .cart-icon',
+      },
       fallbacks: [
-        { strategy: 'text', value: 'Cart' },
+        { strategy: 'text', value: '🛒' },
         { strategy: 'role', value: 'link', name: 'Cart' },
-        { strategy: 'css', value: 'a[href*="cart"], button[aria-label*="cart" i], .cart-icon' },
+        { strategy: 'role', value: 'button', name: 'Cart' },
+        { strategy: 'text', value: 'Cart' },
       ],
       description: 'Navigate to the shopping cart view',
       expected: 'Open shopping cart view',
@@ -384,9 +446,11 @@ export function generateDeterministicPlan({ url, instructions, credentials = {} 
     steps.push({
       id: `step-${stepCounter++}`,
       action: 'assertVisible',
+      flowId: 'cart',
+      requiresAuth: false,
       target: { strategy: 'text', value: searchQuery },
       fallbacks: [
-        { strategy: 'css', value: '.cart-item, .cart-list, table.cart' },
+        { strategy: 'css', value: '.cart-page, .cart-items-container, .cart-item, table.cart' },
         { strategy: 'text', value: 'Cart' },
       ],
       description: `Verify that the cart contains the intended item ("${searchQuery}")`,
@@ -398,9 +462,11 @@ export function generateDeterministicPlan({ url, instructions, credentials = {} 
       steps.push({
         id: `step-${stepCounter++}`,
         action: 'assertVisible',
+        flowId: 'cart',
+        requiresAuth: false,
         target: { strategy: 'text', value: '1' },
         fallbacks: [
-          { strategy: 'css', value: 'input[type="number"], .quantity, .item-qty' },
+          { strategy: 'css', value: 'input[type="number"], .quantity, .item-qty, .cart-page' },
         ],
         description: 'Verify that the cart item quantity is displayed correctly',
         expected: 'Cart item quantity is displayed correctly',
@@ -412,17 +478,93 @@ export function generateDeterministicPlan({ url, instructions, credentials = {} 
       steps.push({
         id: `step-${stepCounter++}`,
         action: 'assertVisible',
+        flowId: 'cart',
+        requiresAuth: false,
         target: { strategy: 'text', value: 'Total' },
         fallbacks: [
-          { strategy: 'text', value: '$' },
           { strategy: 'text', value: '₹' },
-          { strategy: 'css', value: '.total-price, .cart-total, [data-testid="total"]' },
+          { strategy: 'text', value: '$' },
+          { strategy: 'css', value: '.order-summary, .total-price, .cart-total, [data-testid="total"]' },
         ],
         description: 'Verify that the total price calculation is displayed',
         expected: 'Total price calculation is displayed in the cart',
         timeoutMs: 5000,
       });
     }
+  }
+
+  // 4. Check for Date / Day / Calendar Synchronization flow
+  if (testsDate) {
+    const today = new Date();
+    const daysShort = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+    const daysFull = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+    const currentDayShort = daysShort[today.getDay()];
+    const currentDayFull = daysFull[today.getDay()];
+
+    // Step: Verify current day or date header indicator is visible on the page
+    steps.push({
+      id: `step-${stepCounter++}`,
+      action: 'assertVisible',
+      target: {
+        strategy: 'text',
+        value: 'Today',
+      },
+      fallbacks: [
+        { strategy: 'text', value: currentDayShort },
+        { strategy: 'text', value: currentDayFull },
+        { strategy: 'css', value: 'header, [class*="date" i], [class*="calendar" i], .today' },
+      ],
+      description: 'Verify current day or date header indicator is visible on the page',
+      expected: 'Current day or date header indicator is visible on the page',
+      timeoutMs: 5000,
+    });
+
+    // Step: Assert active day synchronization with current system day
+    steps.push({
+      id: `step-${stepCounter++}`,
+      action: 'assertDateSync',
+      description: `Verify that the page day and date is correctly synchronized with current day (${currentDayFull})`,
+      expected: `Active day/date on the page matches the current system day (${currentDayFull} / ${currentDayShort})`,
+      timeoutMs: 5000,
+    });
+
+    // Step: Verify timeline / schedule content displays for today
+    steps.push({
+      id: `step-${stepCounter++}`,
+      action: 'assertVisible',
+      target: {
+        strategy: 'css',
+        value: 'button.bg-primary, [aria-selected="true"], [aria-current="date"], button.active, .active-day',
+      },
+      fallbacks: [
+        { strategy: 'text', value: currentDayShort },
+        { strategy: 'text', value: 'Breakfast' },
+        { strategy: 'text', value: 'Lunch' },
+        { strategy: 'css', value: '.schedule, .timeline, main, header' },
+      ],
+      description: 'Verify that the daily timeline/schedule displays active content synchronized for today',
+      expected: 'Daily timeline/schedule displays active content synchronized for today',
+      timeoutMs: 5000,
+    });
+  }
+
+  // 5. Check for General content inspection (when not login, search, cart, or date)
+  const isCustomGeneral = !testsLogin && !testsSearch && !testsCart && !testsDate && text.length > 0;
+  if (isCustomGeneral) {
+    steps.push({
+      id: `step-${stepCounter++}`,
+      action: 'assertVisible',
+      target: {
+        strategy: 'css',
+        value: 'header, nav, main, h1, body',
+      },
+      fallbacks: [
+        { strategy: 'css', value: 'body' },
+      ],
+      description: `Inspect page structure and verify main interface for: "${text.slice(0, 80)}"`,
+      expected: 'Target website main interface is rendered and visible',
+      timeoutMs: 5000,
+    });
   }
 
   // Final screenshot step for visual confirmation

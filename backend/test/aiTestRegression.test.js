@@ -104,6 +104,99 @@ describe('AI Test Execution Accuracy & Regression Suite', () => {
             </body>
           </html>
         `);
+      } else if (url.pathname === '/home-without-search') {
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end(`
+          <!DOCTYPE html>
+          <html>
+            <head><title>Portal Home</title></head>
+            <body>
+              <nav>
+                <a href="/home-without-search">Home</a>
+                <a href="/medicines">Medicine</a>
+                <a href="/cart" class="cart-btn">🛒</a>
+              </nav>
+              <h2>Portal Home - Book Trusted Doctors</h2>
+              <p>Consultations and healthcare services. Browse medicines via navigation.</p>
+              <!-- Notice: No search input on this homepage -->
+            </body>
+          </html>
+        `);
+      } else if (url.pathname === '/medicines') {
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end(`
+          <!DOCTYPE html>
+          <html>
+            <head><title>Order Medicines Online</title></head>
+            <body>
+              <nav>
+                <a href="/home-without-search">Home</a>
+                <a href="/medicines">Medicine</a>
+                <a href="/cart" class="cart-btn">🛒</a>
+              </nav>
+              <h2>Order Medicines Online</h2>
+              <div class="search-bar">
+                <input class="medicine-search-input" placeholder="Search for medicine..." />
+                <button class="medicine-search-btn">🔍</button>
+              </div>
+              <div id="medicine-list">
+                <div class="medicine-card" data-name="Paracetamol">
+                  <h3>Paracetamol 500mg</h3>
+                  <span class="price">₹ 30</span>
+                  <button class="add-to-cart-btn" onclick="addToCart('Paracetamol 500mg', '30')">Add to Cart</button>
+                </div>
+                <div class="medicine-card" data-name="Amoxicillin">
+                  <h3>Amoxicillin 500mg</h3>
+                  <span class="price">₹ 120</span>
+                  <button class="add-to-cart-btn" onclick="addToCart('Amoxicillin 500mg', '120')">Add to Cart</button>
+                </div>
+              </div>
+              <script>
+                const input = document.querySelector('.medicine-search-input');
+                const list = document.getElementById('medicine-list');
+                function performSearch() {
+                  const query = input.value.toLowerCase().trim();
+                  const cards = list.querySelectorAll('.medicine-card');
+                  cards.forEach(c => {
+                    const name = c.getAttribute('data-name').toLowerCase();
+                    c.style.display = name.includes(query) ? 'block' : 'none';
+                  });
+                }
+                input.addEventListener('keydown', (e) => { if (e.key === 'Enter') performSearch(); });
+                document.querySelector('.medicine-search-btn').addEventListener('click', performSearch);
+                function addToCart(name, price) {
+                  localStorage.setItem('cartItem', name);
+                  localStorage.setItem('cartPrice', price);
+                  localStorage.setItem('cartQty', '1');
+                }
+              </script>
+            </body>
+          </html>
+        `);
+      } else if (url.pathname === '/cart') {
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end(`
+          <!DOCTYPE html>
+          <html>
+            <head><title>Your Shopping Cart</title></head>
+            <body>
+              <div class="cart-page">
+                <h2>Your Shopping Cart</h2>
+                <div class="cart-items-container">
+                  <div class="cart-item">
+                    <span class="item-name">Paracetamol 500mg</span>
+                    <span class="quantity">1</span>
+                    <span class="item-price">₹ 30</span>
+                  </div>
+                </div>
+                <div class="order-summary">
+                  <span class="total-label">Total</span>
+                  <span class="total-price">₹ 30</span>
+                </div>
+              </div>
+            </body>
+          </html>
+        `);
       } else if (url.pathname === '/hanging-timeout') {
         // Delay response to guarantee client step timeout (300ms) without hanging indefinitely
         setTimeout(() => {
@@ -127,6 +220,33 @@ describe('AI Test Execution Accuracy & Regression Suite', () => {
                 <button type="submit">Register Now</button>
               </form>
               <!-- No login link exists anywhere on this page -->
+            </body>
+          </html>
+        `);
+      } else if (url.pathname === '/calendar-sync') {
+        const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+        const currentDay = days[new Date().getDay()];
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end(`
+          <!DOCTYPE html>
+          <html>
+            <head><title>RU Print Portal</title></head>
+            <body>
+              <header><span class="text-lg font-extrabold">Today</span></header>
+              <div class="week-ribbon">
+                ${days
+                  .map(
+                    (d) =>
+                      `<button class="${d === currentDay ? 'bg-primary' : 'bg-muted'}" ${
+                        d === currentDay ? 'aria-selected="true"' : ''
+                      }><span>${d}</span></button>`
+                  )
+                  .join('')}
+              </div>
+              <div class="schedule">
+                <h3>Breakfast</h3>
+                <p>07:30 - 09:30 AM</p>
+              </div>
             </body>
           </html>
         `);
@@ -582,5 +702,180 @@ describe('AI Test Execution Accuracy & Regression Suite', () => {
       assert.equal(report.steps[i].durationMs, 0);
       assert.match(report.steps[i].actual, /Skipped: Prerequisite Step 2 \(assertVisible\) did not succeed/i);
     }
+  });
+
+  it('10. discovers catalog link from homepage, navigates to medicines, searches with Enter, and verifies results', async () => {
+    const plan = {
+      objective: 'Discover catalog and search for Paracetamol',
+      steps: [
+        {
+          id: 'step-1',
+          action: 'navigate',
+          url: `${baseUrl}/home-without-search`,
+          description: 'Navigate to portal homepage without search box',
+          expected: 'Landed on homepage',
+          timeoutMs: 4000,
+        },
+        {
+          id: 'step-2',
+          action: 'ensureSearchPage',
+          description: 'Discover catalog link and reach search interface',
+          expected: 'Catalog page with search input is active',
+          timeoutMs: 4000,
+        },
+        {
+          id: 'step-3',
+          action: 'fill',
+          target: { strategy: 'placeholder', value: 'Search for medicine...' },
+          value: 'Paracetamol',
+          isSearch: true,
+          description: 'Type Paracetamol into search input and submit via Enter',
+          expected: 'Search input accepts Paracetamol',
+          timeoutMs: 3000,
+        },
+        {
+          id: 'step-4',
+          action: 'assertVisible',
+          target: { strategy: 'text', value: 'Paracetamol 500mg' },
+          description: 'Verify matching search result appears',
+          expected: 'Paracetamol 500mg is visible in search results',
+          timeoutMs: 3000,
+        },
+      ],
+    };
+
+    const report = await runAiTest(plan, `${baseUrl}/home-without-search`, { allowLocalForTesting: true });
+    assert.equal(report.status, 'passed');
+    assert.equal(report.passedSteps, 4);
+    assert.equal(report.failedSteps, 0);
+
+    // Verify step 2 navigated from /home-without-search to /medicines
+    const step2 = report.steps[1];
+    assert.equal(step2.status, 'PASS');
+    assert.match(step2.actual, /Discovered catalog navigation link|Navigated to discovered search interface/i);
+    assert.match(report.finalUrl, /\/medicines$/);
+  });
+
+  it('11. adds searched medicine to cart and verifies cart items, quantity, and total price', async () => {
+    const plan = {
+      objective: 'Add medicine to cart and verify cart page',
+      steps: [
+        {
+          id: 'step-1',
+          action: 'navigate',
+          url: `${baseUrl}/medicines`,
+          description: 'Navigate to medicines listing',
+          expected: 'Landed on medicines listing',
+          timeoutMs: 4000,
+        },
+        {
+          id: 'step-2',
+          action: 'click',
+          target: { strategy: 'css', value: '.medicine-card:has-text("Paracetamol") button' },
+          description: 'Click Add to Cart for Paracetamol',
+          expected: 'Product added to cart',
+          timeoutMs: 3000,
+        },
+        {
+          id: 'step-3',
+          action: 'click',
+          target: { strategy: 'css', value: 'a.cart-btn' },
+          description: 'Navigate to cart view',
+          expected: 'Cart view opened',
+          timeoutMs: 3000,
+        },
+        {
+          id: 'step-4',
+          action: 'assertVisible',
+          target: { strategy: 'text', value: 'Paracetamol 500mg' },
+          description: 'Verify Paracetamol is in cart',
+          expected: 'Paracetamol is displayed in cart',
+          timeoutMs: 3000,
+        },
+        {
+          id: 'step-5',
+          action: 'assertVisible',
+          target: { strategy: 'text', value: '1' },
+          description: 'Verify item quantity is 1',
+          expected: 'Item quantity is 1',
+          timeoutMs: 3000,
+        },
+        {
+          id: 'step-6',
+          action: 'assertVisible',
+          target: { strategy: 'text', value: 'Total' },
+          description: 'Verify cart total is displayed',
+          expected: 'Cart total is displayed',
+          timeoutMs: 3000,
+        },
+      ],
+    };
+
+    const report = await runAiTest(plan, `${baseUrl}/medicines`, { allowLocalForTesting: true });
+    assert.equal(report.status, 'passed');
+    assert.equal(report.passedSteps, 6);
+    assert.equal(report.failedSteps, 0);
+    assert.match(report.finalUrl, /\/cart$/);
+  });
+
+  it('12. search step halts with BLOCKED when browser is unauthenticated on login page without credentials', async () => {
+    const plan = {
+      objective: 'Attempt search while unauthenticated on login page',
+      steps: [
+        {
+          id: 'step-1',
+          action: 'navigate',
+          url: `${baseUrl}/login`,
+          description: 'Navigate to login page',
+          expected: 'Landed on login page',
+          timeoutMs: 4000,
+        },
+        {
+          id: 'step-2',
+          action: 'ensureSearchPage',
+          description: 'Attempt to reach search interface from login page',
+          expected: 'Catalog reached',
+          timeoutMs: 3000,
+        },
+        {
+          id: 'step-3',
+          action: 'fill',
+          target: { strategy: 'placeholder', value: 'Search for medicine...' },
+          value: 'Paracetamol',
+          description: 'Fill search query',
+          expected: 'Query filled',
+          timeoutMs: 3000,
+        },
+      ],
+    };
+
+    const report = await runAiTest(plan, `${baseUrl}/login`, { allowLocalForTesting: true });
+    assert.equal(report.status, 'blocked');
+    assert.equal(report.steps[1].status, 'BLOCKED');
+    assert.match(report.steps[1].actual, /unauthenticated Login page/i);
+    assert.match(report.steps[1].actual, /requires authentication/i);
+    assert.equal(report.steps[2].status, 'SKIPPED');
+  });
+
+  it('13. correctly plans and verifies date and day synchronization against live calendar UI', async () => {
+    const { planAiTest } = await import('../src/services/aiPlannerService.js');
+    const plan = await planAiTest({
+      url: `${baseUrl}/calendar-sync`,
+      instructions: 'Identify the date and see if the day and date is correctly synchronized.',
+    });
+
+    assert.equal(plan.status, 'ready');
+    assert.ok(plan.steps.length >= 3);
+    const actions = plan.steps.map((s) => s.action);
+    assert.ok(actions.includes('assertDateSync'));
+
+    const report = await runAiTest(plan, `${baseUrl}/calendar-sync`, { allowLocalForTesting: true });
+    assert.equal(report.status, 'passed');
+    assert.equal(report.failedSteps, 0);
+
+    const dateStep = report.steps.find((s) => s.action === 'assertDateSync');
+    assert.ok(dateStep);
+    assert.equal(dateStep.status, 'PASS');
+    assert.match(dateStep.actual, /correctly synchronized with system date/i);
   });
 });

@@ -1,14 +1,18 @@
 import { validateUrl } from '../utils/urlValidator.js';
 import { planAiTest } from '../services/aiPlannerService.js';
 import { runAiTest } from '../services/aiTestRunner.js';
+import { executeAiAgent } from '../services/aiAgentService.js';
+import { getActiveAiProvider } from '../services/aiProvider/index.js';
 
 /**
  * POST /api/ai-tests/run
  *
  * Single primary endpoint for AI-driven website testing:
  * 1. Validates target URL and safety.
- * 2. Uses AI planner (or deterministic fallback) to generate test plan.
- * 3. Executes browser interactions with Playwright.
+ * 2. If an AI LLM provider is configured (Gemini/OpenAI), runs the autonomous
+ *    Observe-Plan-Act-Verify agent loop.
+ * 3. If no LLM provider is configured, runs the deterministic planner/runner with
+ *    clear fallback attribution.
  * 4. Returns structured results with step outcomes, assertions, and evidence.
  */
 export const runAiTestEndpoint = async (req, res) => {
@@ -53,14 +57,27 @@ export const runAiTestEndpoint = async (req, res) => {
       });
     }
 
-    // 4. Generate AI test plan
+    // 4. If a live AI Provider is configured, execute the autonomous agent loop
+    const activeProvider = getActiveAiProvider();
+    if (activeProvider) {
+      const agentReport = await executeAiAgent({
+        url: trimmedUrl,
+        instructions: instructions.trim(),
+        credentials: credentials || {},
+      });
+      return res.status(200).json({
+        success: true,
+        data: agentReport,
+      });
+    }
+
+    // 5. Fallback planner & browser runner when no AI key is configured
     const plan = await planAiTest({
       url: trimmedUrl,
       instructions: instructions.trim(),
       credentials: credentials || {},
     });
 
-    // 5. Execute browser test with Playwright
     const report = await runAiTest(plan, trimmedUrl);
 
     return res.status(200).json({

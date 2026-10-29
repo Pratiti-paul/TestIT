@@ -16,16 +16,46 @@ export function getApiBaseUrl() {
 
 /**
  * Returns candidate base URLs to attempt if the configured URL suffers from a local port conflict.
- * Only attempts fallback ports if the configured URL targets port 5000 (which conflicts with macOS AirPlay).
+ * Prioritizes Vite's local dev server proxy (relative ''), followed by port 5001.
+ * Port 5000 is avoided because of the macOS ControlCenter / AirPlay Receiver conflict.
  *
  * @returns {string[]}
  */
 export function getCandidateBaseUrls() {
   const primary = getApiBaseUrl();
-  if (primary.includes(':5000')) {
-    return [primary, 'http://localhost:5001', 'http://127.0.0.1:5001', 'http://[::1]:5000'];
+  const candidates = [];
+
+  // When a specific custom base URL is explicitly configured (other than default 5000/5001), use it directly
+  if (primary && !primary.includes(':5000') && !primary.includes(':5001')) {
+    return [primary];
   }
-  return [primary];
+
+  // When a specific base URL is configured (and not port 5000), prioritize it first
+  if (primary && !primary.includes(':5000')) {
+    candidates.push(primary);
+  }
+
+  // In a browser environment, Vite's dev server proxy (/api -> :5001) is available
+  if (typeof window !== 'undefined' && window.location?.origin) {
+    if (!candidates.includes('')) {
+      candidates.push('');
+    }
+  }
+
+  // If primary targets 5000 (macOS AirPlay conflict) or fails, try port 5001
+  if (!candidates.includes('http://localhost:5001')) {
+    candidates.push('http://localhost:5001');
+  }
+  if (!candidates.includes('http://127.0.0.1:5001')) {
+    candidates.push('http://127.0.0.1:5001');
+  }
+
+  // If primary was port 5000, add it as a last resort
+  if (primary && primary.includes(':5000') && !candidates.includes(primary)) {
+    candidates.push(primary);
+  }
+
+  return candidates;
 }
 
 /**
@@ -39,7 +69,9 @@ export async function runWebsiteScan(url, signal) {
   const candidates = getCandidateBaseUrls();
   let lastError = null;
 
-  for (const baseUrl of candidates) {
+  for (let i = 0; i < candidates.length; i++) {
+    const baseUrl = candidates[i];
+    const isLastCandidate = i === candidates.length - 1;
     const endpoint = `${baseUrl}/api/scans/preview`;
     try {
       const response = await fetch(endpoint, {
@@ -78,8 +110,9 @@ export async function runWebsiteScan(url, signal) {
     }
   }
 
+  const attemptedTarget = getApiBaseUrl().includes(':5000') ? 'http://localhost:5001' : getApiBaseUrl();
   throw new Error(
-    `Unable to reach TestIT backend at ${getApiBaseUrl()}. Ensure the backend server is running and accessible.`
+    `Unable to reach TestIT backend at ${attemptedTarget}. Ensure the backend server is running on port 5001.`
   );
 }
 
@@ -132,7 +165,9 @@ export async function executeFunctionalTest(definition, signal) {
   const candidates = getCandidateBaseUrls();
   let lastError = null;
 
-  for (const baseUrl of candidates) {
+  for (let i = 0; i < candidates.length; i++) {
+    const baseUrl = candidates[i];
+    const isLastCandidate = i === candidates.length - 1;
     const endpoint = `${baseUrl}/api/functional-tests/execute`;
     try {
       const response = await fetch(endpoint, {
@@ -175,8 +210,9 @@ export async function executeFunctionalTest(definition, signal) {
     }
   }
 
+  const attemptedTarget = getApiBaseUrl().includes(':5000') ? 'http://localhost:5001' : getApiBaseUrl();
   throw new Error(
-    `Unable to reach TestIT backend at ${getApiBaseUrl()}. Ensure the backend server is running.`
+    `Unable to reach TestIT backend at ${attemptedTarget}. Ensure the backend server is running on port 5001.`
   );
 }
 
@@ -197,7 +233,9 @@ export async function executeAiTest(payload, signal) {
   const candidates = getCandidateBaseUrls();
   let lastError = null;
 
-  for (const baseUrl of candidates) {
+  for (let i = 0; i < candidates.length; i++) {
+    const baseUrl = candidates[i];
+    const isLastCandidate = i === candidates.length - 1;
     const endpoint = `${baseUrl}/api/ai-tests/run`;
     try {
       const response = await fetch(endpoint, {
@@ -236,7 +274,8 @@ export async function executeAiTest(payload, signal) {
     }
   }
 
+  const attemptedTarget = getApiBaseUrl().includes(':5000') ? 'http://localhost:5001' : getApiBaseUrl();
   throw new Error(
-    `Unable to reach TestIT backend at ${getApiBaseUrl()}. Ensure the backend server is running and accessible.`
+    `Unable to reach TestIT backend at ${attemptedTarget}. Ensure the backend server is running on port 5001.`
   );
 }
