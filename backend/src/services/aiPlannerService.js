@@ -116,25 +116,56 @@ export function generateDeterministicPlan({ url, instructions, credentials = {} 
   const lower = text.toLowerCase();
   const steps = [];
 
+  // Check what functional flows are actually requested
+  const testsLogin = lower.includes('login') || lower.includes('log in') || lower.includes('sign in');
+  const testsInvalid = lower.includes('invalid') || lower.includes('wrong') || lower.includes('bad credential');
+  const testsValid = lower.includes('valid') || lower.includes('success');
+  const testsSearch = lower.includes('search') || lower.includes('find') || lower.includes('query');
+  const testsCart = lower.includes('cart') || lower.includes('add to cart') || lower.includes('add the first result');
+
+  // If the instructions describe a flow the fallback cannot reliably construct without an LLM
+  if (!testsLogin && !testsSearch && !testsCart) {
+    return {
+      status: 'unsupported',
+      unsupportedReason:
+        'The deterministic fallback engine cannot reliably plan this custom user journey without an AI model. Please configure an AI API key (GEMINI_API_KEY or OPENAI_API_KEY) in backend/.env, or specify supported flows (e.g., login, search, add to cart).',
+      objective: `Unsupported journey: ${text.slice(0, 100)}`,
+      steps: [],
+    };
+  }
+
   // Step 1: Always navigate to the starting page
   steps.push({
     id: 'step-1',
     action: 'navigate',
     url,
     description: `Navigate to target website (${url})`,
+    expected: `Navigate to target website (${url})`,
     timeoutMs: 10000,
   });
 
   let stepCounter = 2;
 
   // 1. Check for Login testing
-  const testsLogin = lower.includes('login') || lower.includes('log in') || lower.includes('sign in');
-  const testsInvalid = lower.includes('invalid') || lower.includes('wrong') || lower.includes('bad credential');
-  const testsValid = lower.includes('valid') || lower.includes('success');
-
   if (testsLogin) {
+    // Step 2: Ensure Login Page (detect signup vs login page, navigate to login if needed)
+    steps.push({
+      id: `step-${stepCounter++}`,
+      action: 'ensureLoginPage',
+      target: { strategy: 'text', value: 'Login' },
+      fallbacks: [
+        { strategy: 'role', value: 'link', name: 'Login' },
+        { strategy: 'role', value: 'link', name: 'Log in' },
+        { strategy: 'role', value: 'link', name: 'Sign in' },
+        { strategy: 'css', value: 'a[href*="login" i], a[href*="signin" i], a:has-text("Login")' },
+      ],
+      description: 'Confirm current page is Login or navigate to Login page from Signup/Home',
+      expected: 'Current page confirmed as Login page with email and password inputs',
+      timeoutMs: 8000,
+    });
+
     // If testing invalid credentials
-    if (testsInvalid) {
+    if (testsInvalid || (!testsValid && !credentials.username)) {
       steps.push({
         id: `step-${stepCounter++}`,
         action: 'fill',
@@ -147,6 +178,7 @@ export function generateDeterministicPlan({ url, instructions, credentials = {} 
         ],
         value: 'invalid.tester@example.com',
         description: 'Enter invalid username/email to verify rejection',
+        expected: 'Login form email/username field accepts input',
         timeoutMs: 5000,
       });
 
@@ -161,6 +193,7 @@ export function generateDeterministicPlan({ url, instructions, credentials = {} 
         value: 'WrongPassword123!',
         isSensitive: true,
         description: 'Enter invalid password to test authentication rejection',
+        expected: 'Login form password field accepts input',
         timeoutMs: 5000,
       });
 
@@ -175,12 +208,13 @@ export function generateDeterministicPlan({ url, instructions, credentials = {} 
           { strategy: 'css', value: 'button[type="submit"], input[type="submit"]' },
         ],
         description: 'Submit invalid login credentials',
+        expected: 'Submit login credentials to observe authentication rejection',
         timeoutMs: 5000,
       });
 
       steps.push({
         id: `step-${stepCounter++}`,
-        action: 'assertVisible',
+        action: 'assertInvalidLogin',
         target: { strategy: 'text', value: 'Invalid' },
         fallbacks: [
           { strategy: 'text', value: 'incorrect' },
@@ -188,7 +222,8 @@ export function generateDeterministicPlan({ url, instructions, credentials = {} 
           { strategy: 'role', value: 'alert' },
           { strategy: 'css', value: '.error, .alert, [role="alert"]' },
         ],
-        description: 'Verify login error message is displayed for invalid credentials',
+        description: 'Verify login error message is displayed or user remains unauthenticated on login page',
+        expected: 'Observable authentication error displayed or user remains unauthenticated on login page',
         timeoutMs: 5000,
       });
     }
@@ -207,6 +242,7 @@ export function generateDeterministicPlan({ url, instructions, credentials = {} 
         ],
         value: credentials.username,
         description: 'Enter valid test account username/email',
+        expected: `Enter valid username/email "${credentials.username}"`,
         timeoutMs: 5000,
       });
 
@@ -221,6 +257,7 @@ export function generateDeterministicPlan({ url, instructions, credentials = {} 
         value: credentials.password,
         isSensitive: true,
         description: 'Enter valid test account password',
+        expected: 'Enter valid password into login form',
         timeoutMs: 5000,
       });
 
@@ -235,6 +272,7 @@ export function generateDeterministicPlan({ url, instructions, credentials = {} 
           { strategy: 'css', value: 'button[type="submit"], input[type="submit"]' },
         ],
         description: 'Submit valid login credentials',
+        expected: 'Submit valid credentials and complete authentication',
         timeoutMs: 5000,
       });
 
@@ -251,13 +289,13 @@ export function generateDeterministicPlan({ url, instructions, credentials = {} 
           { strategy: 'text', value: 'Dashboard' },
         ],
         description: 'Verify reliable post-login condition (authenticated session is active)',
+        expected: 'Authenticated session indicators (Logout, Dashboard, or Account) are visible',
         timeoutMs: 8000,
       });
     }
   }
 
   // 2. Check for Search flow
-  const testsSearch = lower.includes('search') || lower.includes('find') || lower.includes('query');
   let searchQuery = 'Paracetamol';
 
   if (testsSearch) {
@@ -280,6 +318,7 @@ export function generateDeterministicPlan({ url, instructions, credentials = {} 
       ],
       value: searchQuery,
       description: `Type "${searchQuery}" into the search input`,
+      expected: `Search input accepts query "${searchQuery}"`,
       timeoutMs: 5000,
     });
 
@@ -292,6 +331,7 @@ export function generateDeterministicPlan({ url, instructions, credentials = {} 
         { strategy: 'css', value: 'button[type="submit"], form button, .search-btn' },
       ],
       description: `Submit search query for "${searchQuery}"`,
+      expected: `Submit search query to display relevant search results`,
       timeoutMs: 5000,
     });
 
@@ -305,13 +345,12 @@ export function generateDeterministicPlan({ url, instructions, credentials = {} 
         { strategy: 'css', value: '.search-results, .product-card, .results' },
       ],
       description: `Verify that search results matching "${searchQuery}" are displayed`,
+      expected: `Search results matching "${searchQuery}" are displayed`,
       timeoutMs: 5000,
     });
   }
 
   // 3. Check for Cart / Add to Cart flow
-  const testsCart = lower.includes('cart') || lower.includes('add to cart') || lower.includes('add the first result');
-
   if (testsCart) {
     steps.push({
       id: `step-${stepCounter++}`,
@@ -324,6 +363,7 @@ export function generateDeterministicPlan({ url, instructions, credentials = {} 
         { strategy: 'css', value: '.add-to-cart, button[aria-label*="cart" i], .product-card button' },
       ],
       description: `Add item ("${searchQuery}") to the shopping cart`,
+      expected: `Add product ("${searchQuery}") to the shopping cart`,
       timeoutMs: 5000,
     });
 
@@ -337,6 +377,7 @@ export function generateDeterministicPlan({ url, instructions, credentials = {} 
         { strategy: 'css', value: 'a[href*="cart"], button[aria-label*="cart" i], .cart-icon' },
       ],
       description: 'Navigate to the shopping cart view',
+      expected: 'Open shopping cart view',
       timeoutMs: 5000,
     });
 
@@ -349,6 +390,7 @@ export function generateDeterministicPlan({ url, instructions, credentials = {} 
         { strategy: 'text', value: 'Cart' },
       ],
       description: `Verify that the cart contains the intended item ("${searchQuery}")`,
+      expected: `Shopping cart contains the intended item ("${searchQuery}")`,
       timeoutMs: 5000,
     });
 
@@ -361,6 +403,7 @@ export function generateDeterministicPlan({ url, instructions, credentials = {} 
           { strategy: 'css', value: 'input[type="number"], .quantity, .item-qty' },
         ],
         description: 'Verify that the cart item quantity is displayed correctly',
+        expected: 'Cart item quantity is displayed correctly',
         timeoutMs: 5000,
       });
     }
@@ -376,6 +419,7 @@ export function generateDeterministicPlan({ url, instructions, credentials = {} 
           { strategy: 'css', value: '.total-price, .cart-total, [data-testid="total"]' },
         ],
         description: 'Verify that the total price calculation is displayed',
+        expected: 'Total price calculation is displayed in the cart',
         timeoutMs: 5000,
       });
     }
@@ -386,6 +430,7 @@ export function generateDeterministicPlan({ url, instructions, credentials = {} 
     id: `step-${stepCounter++}`,
     action: 'screenshot',
     description: 'Capture evidence snapshot of final verified page state',
+    expected: 'Visual evidence snapshot captured',
     timeoutMs: 5000,
   });
 
@@ -509,6 +554,26 @@ export async function planAiTest({ url, instructions, credentials = {} }) {
 
   // 4. Deterministic Fallback Engine (no LLM configured or LLM failed)
   const fallbackPlan = generateDeterministicPlan({ url, instructions, credentials });
+
+  if (fallbackPlan.status === 'unsupported') {
+    return {
+      status: 'unsupported',
+      unsupportedReason: fallbackPlan.unsupportedReason,
+      blockedReason: fallbackPlan.unsupportedReason,
+      missingCredentials: [],
+      prohibitedActions: [],
+      planner: {
+        mode: 'deterministic_fallback',
+        provider: 'rule_based_engine',
+        model: 'testit-rules-v1',
+        aiConfigured: false,
+        notice:
+          'No AI API key is configured and the instructions cannot be reliably planned by the deterministic fallback rules engine. Configure an AI API key (GEMINI_API_KEY or OPENAI_API_KEY) in backend/.env, or specify supported user flows (login, search, add to cart).',
+      },
+      objective: fallbackPlan.objective,
+      steps: [],
+    };
+  }
 
   return {
     ...fallbackPlan,

@@ -249,7 +249,7 @@ describe('AI-Driven Website Testing Engine', () => {
 
       // Check failure screenshot was captured
       const failedStep = report.steps[1];
-      assert.equal(failedStep.status, 'failed');
+      assert.equal(failedStep.status, 'FAIL');
       assert.match(failedStep.screenshot, /^data:image\/png;base64,/);
     });
 

@@ -1355,8 +1355,18 @@
   transition: border-color 0.15s ease;
 }
 
-.step-result-card.card-failed {
+.step-result-card.card-failed,
+.step-result-card.card-error {
   border-color: var(--critical-border);
+}
+
+.step-result-card.card-blocked {
+  border-color: var(--medium-border);
+}
+
+.step-result-card.card-skipped {
+  border-color: var(--border);
+  opacity: 0.8;
 }
 
 .step-result-top {
@@ -1431,10 +1441,23 @@
   border: 1px solid var(--success-border);
 }
 
-.pill-failed {
+.pill-failed,
+.pill-error {
   background: var(--critical-bg);
   color: var(--critical);
   border: 1px solid var(--critical-border);
+}
+
+.pill-blocked {
+  background: var(--medium-bg);
+  color: var(--medium);
+  border: 1px solid var(--medium-border);
+}
+
+.pill-skipped {
+  background: var(--code-bg);
+  color: var(--text-muted);
+  border: 1px solid var(--border);
 }
 
 .step-outcomes-grid {
@@ -1464,6 +1487,17 @@
 .actual-failed {
   background: var(--critical-bg);
   border: 1px solid var(--critical-border);
+}
+
+.actual-blocked {
+  background: var(--medium-bg);
+  border: 1px solid var(--medium-border);
+}
+
+.actual-skipped {
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  color: var(--text-muted);
 }
 
 .outcome-label {

@@ -12,17 +12,20 @@ import {
   Cpu,
   Lock,
   ShieldAlert,
+  SkipForward,
+  HelpCircle,
 } from 'lucide-react';
 
 /**
  * AiTestResults
  *
  * Renders the complete AI test report:
- * - Overall status banner (PASSED / FAILED / PARTIAL / BLOCKED)
+ * - Overall status banner (PASSED / FAILED / PARTIAL / BLOCKED / UNSUPPORTED)
  * - AI Planner metadata & clear deterministic fallback indicator
  * - Blocked / Prerequisite requirements banner
  * - Metrics summary cards and live page diagnostics
  * - Step-by-step execution timeline with expected vs actual outcomes
+ * - Clear status badges: PASS, FAIL, BLOCKED, ERROR, SKIPPED
  * - Evidence screenshots and enlarged modal preview
  */
 export function AiTestResults({ report }) {
@@ -31,10 +34,11 @@ export function AiTestResults({ report }) {
 
   if (!report) return null;
 
-  const isPassed = report.status === 'passed';
-  const isBlocked = report.status === 'blocked';
-  const isPartial = report.status === 'partial';
-  const isFailed = report.status === 'failed';
+  const isPassed = report.status === 'passed' || report.status === 'PASS';
+  const isBlocked = report.status === 'blocked' || report.status === 'BLOCKED';
+  const isPartial = report.status === 'partial' || report.status === 'PARTIAL';
+  const isUnsupported = report.status === 'unsupported';
+  const isFailed = report.status === 'failed' || report.status === 'FAIL' || report.status === 'error';
 
   const durationSec = ((report.durationMs || 0) / 1000).toFixed(2);
 
@@ -56,6 +60,8 @@ export function AiTestResults({ report }) {
             ? 'status-banner-blocked'
             : isPartial
             ? 'status-banner-partial'
+            : isUnsupported
+            ? 'status-banner-blocked'
             : 'status-banner-failed'
         }`}
         role="status"
@@ -67,6 +73,7 @@ export function AiTestResults({ report }) {
             {isFailed && <XCircle size={38} className="icon-failed" aria-hidden="true" />}
             {isPartial && <AlertTriangle size={38} className="icon-partial" aria-hidden="true" />}
             {isBlocked && <ShieldAlert size={38} className="icon-blocked" aria-hidden="true" />}
+            {isUnsupported && <HelpCircle size={38} className="icon-blocked" aria-hidden="true" />}
           </div>
           <div className="status-text-content">
             <span className="status-label-eyebrow">AI QA Test Outcome</span>
@@ -75,6 +82,7 @@ export function AiTestResults({ report }) {
               {isFailed && 'Test Verification Failed'}
               {isPartial && 'Partial Test Journey Completed'}
               {isBlocked && 'Test Execution Blocked'}
+              {isUnsupported && 'Clarification / AI Key Required'}
             </h2>
             <p className="status-subtitle">
               {report.objective || report.testName || 'AI Website Test'}
@@ -116,12 +124,12 @@ export function AiTestResults({ report }) {
         </div>
       )}
 
-      {/* 3. Blocked Policy / Prerequisite Alert */}
-      {isBlocked && (
+      {/* 3. Blocked Policy / Prerequisite / Unsupported Alert */}
+      {(isBlocked || isUnsupported) && (
         <div className="failure-alert-box blocked-alert-box" role="alert">
           <div className="failure-box-header">
             <Lock size={20} className="icon-alert" aria-hidden="true" />
-            <h3>Test Execution Blocked</h3>
+            <h3>{isUnsupported ? 'Flow Not Supported by Fallback Engine' : 'Test Execution Blocked'}</h3>
           </div>
           <p className="failure-message">{report.blockedReason}</p>
           {Array.isArray(report.missingCredentials) && report.missingCredentials.length > 0 && (
@@ -139,7 +147,9 @@ export function AiTestResults({ report }) {
           <div className="failure-box-header">
             <AlertTriangle size={20} className="icon-alert" aria-hidden="true" />
             <h3>
-              Verification Failed at Step {report.failure.stepIndex} ({report.failure.action})
+              {report.failure.status === 'ERROR'
+                ? `Technical Error at Step ${report.failure.stepIndex} (${report.failure.action})`
+                : `Verification Failed at Step ${report.failure.stepIndex} (${report.failure.action})`}
             </h3>
           </div>
           <p className="failure-message">{report.failure.message}</p>
@@ -162,11 +172,25 @@ export function AiTestResults({ report }) {
 
         <div className="metric-card metric-card-failed">
           <span className="metric-label">Failed Steps</span>
-          <strong className="metric-value metric-value-failed">{report.failedSteps || 0}</strong>
+          <strong className="metric-value metric-value-failed">
+            {(report.failedSteps || 0) + (report.errorSteps || 0)}
+          </strong>
           <span className="metric-caption">
-            {report.failedSteps === 0 ? 'No failures' : 'Caused test halt'}
+            {(report.failedSteps || 0) + (report.errorSteps || 0) === 0 ? 'No failures' : 'Caused test halt'}
           </span>
         </div>
+
+        {((report.blockedSteps || 0) > 0 || (report.skippedSteps || 0) > 0) && (
+          <div className="metric-card">
+            <span className="metric-label">Blocked / Skipped</span>
+            <strong className="metric-value">
+              {(report.blockedSteps || 0) + (report.skippedSteps || 0)}
+            </strong>
+            <span className="metric-caption">
+              {report.blockedSteps || 0} blocked, {report.skippedSteps || 0} skipped
+            </span>
+          </div>
+        )}
 
         <div className="metric-card">
           <span className="metric-label">Page Status</span>
@@ -193,14 +217,50 @@ export function AiTestResults({ report }) {
 
           <div className="step-cards-list">
             {report.steps.map((step) => {
-              const stepPassed = step.status === 'passed';
+              const normStatus = (step.status || '').toUpperCase();
+              const isPass = normStatus === 'PASS' || normStatus === 'PASSED';
+              const isFail = normStatus === 'FAIL' || normStatus === 'FAILED';
+              const isBlock = normStatus === 'BLOCKED';
+              const isErr = normStatus === 'ERROR';
+              const isSkip = normStatus === 'SKIPPED';
+
+              const cardClass = isPass
+                ? 'card-passed'
+                : isFail
+                ? 'card-failed'
+                : isBlock
+                ? 'card-blocked'
+                : isErr
+                ? 'card-error'
+                : 'card-skipped';
+
+              const pillClass = isPass
+                ? 'pill-passed'
+                : isFail
+                ? 'pill-failed'
+                : isBlock
+                ? 'pill-blocked'
+                : isErr
+                ? 'pill-error'
+                : 'pill-skipped';
+
+              const actualBlockClass = isPass
+                ? 'actual-passed'
+                : isFail
+                ? 'actual-failed'
+                : isBlock
+                ? 'actual-blocked'
+                : isErr
+                ? 'actual-failed'
+                : 'actual-skipped';
+
               const hasScreenshot = Boolean(step.screenshot);
               const isExpanded = Boolean(expandedScreenshots[step.stepIndex]);
 
               return (
                 <article
                   key={step.id || step.stepIndex}
-                  className={`step-result-card ${stepPassed ? 'card-passed' : 'card-failed'}`}
+                  className={`step-result-card ${cardClass}`}
                 >
                   <div className="step-result-top">
                     <div className="step-info-group">
@@ -216,20 +276,35 @@ export function AiTestResults({ report }) {
                         <Clock size={13} aria-hidden="true" />
                         <span>{step.durationMs || 0}ms</span>
                       </span>
-                      <span
-                        className={`step-status-pill ${
-                          stepPassed ? 'pill-passed' : 'pill-failed'
-                        }`}
-                      >
-                        {stepPassed ? (
+                      <span className={`step-status-pill ${pillClass}`}>
+                        {isPass && (
                           <>
                             <CheckCircle2 size={14} aria-hidden="true" />
                             <span>PASSED</span>
                           </>
-                        ) : (
+                        )}
+                        {isFail && (
                           <>
                             <XCircle size={14} aria-hidden="true" />
                             <span>FAILED</span>
+                          </>
+                        )}
+                        {isBlock && (
+                          <>
+                            <ShieldAlert size={14} aria-hidden="true" />
+                            <span>BLOCKED</span>
+                          </>
+                        )}
+                        {isErr && (
+                          <>
+                            <AlertTriangle size={14} aria-hidden="true" />
+                            <span>ERROR</span>
+                          </>
+                        )}
+                        {isSkip && (
+                          <>
+                            <SkipForward size={14} aria-hidden="true" />
+                            <span>SKIPPED</span>
                           </>
                         )}
                       </span>
@@ -242,11 +317,7 @@ export function AiTestResults({ report }) {
                       <p className="outcome-text">{step.expected}</p>
                     </div>
 
-                    <div
-                      className={`outcome-block actual-block ${
-                        stepPassed ? 'actual-passed' : 'actual-failed'
-                      }`}
-                    >
+                    <div className={`outcome-block actual-block ${actualBlockClass}`}>
                       <span className="outcome-label">Actual:</span>
                       <p className="outcome-text">{step.actual}</p>
                     </div>
@@ -320,4 +391,3 @@ export function AiTestResults({ report }) {
     </section>
   );
 }
-

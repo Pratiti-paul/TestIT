@@ -6,6 +6,310 @@ const MAX_CONCURRENT_TESTS = parseInt(process.env.MAX_CONCURRENT_SCANS, 10) || 3
 let activeTests = 0;
 
 /**
+ * Generic inspection of the active page to determine page type and available controls.
+ * Uses common web conventions and heuristics without hardcoding target-specific selectors.
+ *
+ * @param {import('playwright').Page} page
+ * @returns {Promise<object>} Page structure analysis
+ */
+export async function inspectPageType(page) {
+  let pathname = '';
+  try {
+    pathname = new URL(page.url()).pathname.toLowerCase();
+  } catch {
+    pathname = '';
+  }
+
+  const analysis = await page
+    .evaluate(() => {
+      const headings = Array.from(document.querySelectorAll('h1, h2, h3')).map((h) =>
+        (h.textContent || '').trim().toLowerCase()
+      );
+
+      const inputs = Array.from(document.querySelectorAll('input:not([type="hidden"])')).map((i) => ({
+        type: (i.getAttribute('type') || 'text').toLowerCase(),
+        name: (i.getAttribute('name') || '').toLowerCase(),
+        placeholder: (i.getAttribute('placeholder') || '').toLowerCase(),
+        id: (i.getAttribute('id') || '').toLowerCase(),
+        ariaLabel: (i.getAttribute('aria-label') || '').toLowerCase(),
+      }));
+
+      const buttons = Array.from(
+        document.querySelectorAll('button, input[type="submit"], [role="button"]')
+      ).map((b) => (b.textContent || b.value || b.getAttribute('aria-label') || '').trim().toLowerCase());
+
+      const links = Array.from(document.querySelectorAll('a, [role="link"]')).map((a) => ({
+        text: (a.textContent || '').trim().toLowerCase(),
+        href: (a.getAttribute('href') || '').toLowerCase(),
+      }));
+
+      return { headings, inputs, buttons, links };
+    })
+    .catch(() => ({ headings: [], inputs: [], buttons: [], links: [] }));
+
+  // URL path checks with word boundaries / segment matching
+  const isSignupPath = /(?:^|\/)(signup|sign-up|register|join|create-account)/i.test(pathname);
+  const isLoginPath = /(?:^|\/)(login|signin|sign-in)/i.test(pathname) && !isSignupPath;
+
+  const hasSignupHeading = analysis.headings.some(
+    (h) =>
+      h.includes('sign up') ||
+      h.includes('signup') ||
+      h.includes('register') ||
+      h.includes('create account') ||
+      h.includes('create an account') ||
+      h.includes('join')
+  );
+
+  const hasSignupButton = analysis.buttons.some(
+    (b) =>
+      b.includes('sign up') ||
+      b.includes('signup') ||
+      b.includes('register') ||
+      b.includes('create account')
+  );
+
+  const hasConfirmPassword = analysis.inputs.some(
+    (i) => i.name.includes('confirm') || i.placeholder.includes('confirm') || i.id.includes('confirm')
+  );
+
+  const hasNameInput = analysis.inputs.some(
+    (i) =>
+      i.name === 'name' ||
+      i.name.includes('fullname') ||
+      i.name.includes('username') ||
+      i.placeholder.includes('name')
+  );
+
+  const isSignupPage =
+    isSignupPath ||
+    hasSignupHeading ||
+    hasSignupButton ||
+    (hasConfirmPassword && hasNameInput);
+
+  // Check for login indicators
+  const hasLoginHeading = analysis.headings.some(
+    (h) =>
+      h.includes('log in') ||
+      h.includes('login') ||
+      h.includes('sign in') ||
+      h.includes('signin') ||
+      h.includes('welcome back') ||
+      h.includes('account login')
+  );
+
+  const hasLoginButton = analysis.buttons.some(
+    (b) => b === 'log in' || b === 'login' || b === 'sign in' || b === 'signin'
+  );
+
+  const hasPasswordField = analysis.inputs.some((i) => i.type === 'password');
+  const hasEmailOrUsername = analysis.inputs.some(
+    (i) =>
+      i.type === 'email' ||
+      i.name.includes('email') ||
+      i.name.includes('username') ||
+      i.placeholder.includes('email') ||
+      i.placeholder.includes('username') ||
+      i.ariaLabel.includes('email') ||
+      i.ariaLabel.includes('username')
+  );
+
+  const hasLoginFormControls =
+    hasPasswordField && hasEmailOrUsername && !hasConfirmPassword && !hasNameInput;
+
+  const isLoginPage =
+    !isSignupPage &&
+    (isLoginPath || hasLoginHeading || (hasLoginButton && hasLoginFormControls));
+
+  return {
+    pathname,
+    isSignupPage,
+    isLoginPage,
+    hasLoginFormControls,
+    headings: analysis.headings,
+    links: analysis.links,
+  };
+}
+
+/**
+ * Ensures the browser is positioned on a real login page before attempting login interactions.
+ * If currently on a signup or home page, discovers and navigates via available login links.
+ * Halts with BLOCKED if no login page can be identified or reached.
+ *
+ * @param {import('playwright').Page} page
+ * @param {object} step
+ * @param {number} timeout
+ * @returns {Promise<{ expected: string, actual: string }>}
+ */
+export async function ensureLoginPage(page, step, timeout) {
+  const currentUrl = page.url();
+  const info = await inspectPageType(page);
+
+  // 1. If already on a confirmed login page with controls
+  if (info.isLoginPage && info.hasLoginFormControls) {
+    return {
+      expected: step.expected || 'Confirm active page is the login page',
+      actual: `Verified current page is Login Page (${currentUrl}) with login controls`,
+    };
+  }
+
+  // 2. Discover login navigation link / button
+  const loginLinkSelectors = [
+    'a:has-text("Already have an account")',
+    'a:has-text("Log in")',
+    'a:has-text("Login")',
+    'a:has-text("Sign in")',
+    'a[href*="login" i]',
+    'a[href*="signin" i]',
+    'a[href*="sign-in" i]',
+    'button:has-text("Login")',
+    'button:has-text("Log in")',
+    'button:has-text("Sign in")',
+    'nav a:has-text("Login")',
+    'header a:has-text("Login")',
+  ];
+
+  let clickedLink = null;
+  for (const selector of loginLinkSelectors) {
+    const loc = page.locator(selector).first();
+    const isVisible = await loc.isVisible({ timeout: 400 }).catch(() => false);
+    if (isVisible) {
+      clickedLink = loc;
+      break;
+    }
+  }
+
+  if (clickedLink) {
+    const prevUrl = page.url();
+    await clickedLink.click({ timeout: Math.min(timeout, 4000) });
+    await page.waitForLoadState('domcontentloaded', { timeout: Math.min(timeout, 5000) }).catch(() => {});
+    await page.waitForTimeout(500);
+
+    const postUrl = page.url();
+    const postInfo = await inspectPageType(page);
+
+    if (postInfo.isLoginPage || postInfo.hasLoginFormControls) {
+      return {
+        expected: step.expected || 'Navigate from registration/home page to login page',
+        actual: `Discovered login navigation link and transitioned from ${prevUrl} to Login page (${postUrl})`,
+      };
+    }
+
+    const err = new Error(
+      `Discovered and clicked login link, but arrived on page (${postUrl}) that does not present login controls.`
+    );
+    err.statusType = 'BLOCKED';
+    throw err;
+  }
+
+  // 3. No login link could be found
+  const reason = info.isSignupPage
+    ? `Target URL landed on a registration/signup page (${currentUrl}), and no login navigation link ("Already have an account? Login", etc.) was discovered.`
+    : `Target URL (${currentUrl}) is not a login page and does not present login controls or a visible login navigation link.`;
+
+  const err = new Error(`Prerequisite verification blocked: ${reason}`);
+  err.statusType = 'BLOCKED';
+  throw err;
+}
+
+/**
+ * Verifies the application's response to invalid login credentials:
+ * - Checks for an observable error message or alert, OR
+ * - Verifies user remains unauthenticated on the login page (not redirected to authenticated area).
+ *
+ * @param {import('playwright').Page} page
+ * @param {object} step
+ * @param {number} timeout
+ * @returns {Promise<{ expected: string, actual: string }>}
+ */
+export async function assertInvalidLogin(page, step, timeout) {
+  // Settle time for network and DOM update
+  await page.waitForTimeout(1000);
+
+  const currentUrl = page.url();
+
+  // 1. Search for observable error messages / alerts
+  const errorSelectors = [
+    '[role="alert"]',
+    '.error',
+    '.alert',
+    '.notification-danger',
+    '.toast-error',
+    'p:has-text("Invalid")',
+    'p:has-text("incorrect")',
+    'span:has-text("Invalid")',
+    'span:has-text("incorrect")',
+    'div:has-text("Invalid credentials")',
+    'div:has-text("User not found")',
+    'div:has-text("Wrong password")',
+  ];
+
+  let observedErrorText = null;
+  for (const selector of errorSelectors) {
+    const loc = page.locator(selector).first();
+    const visible = await loc.isVisible({ timeout: 200 }).catch(() => false);
+    if (visible) {
+      const text = (await loc.textContent().catch(() => '')) || '';
+      if (text.trim()) {
+        observedErrorText = text.trim();
+        break;
+      }
+    }
+  }
+
+  // 2. Check if user was incorrectly granted access
+  const isRedirectedToAuth =
+    currentUrl.includes('/dashboard') ||
+    currentUrl.includes('/account') ||
+    currentUrl.includes('/home') ||
+    currentUrl.includes('/profile');
+
+  if (isRedirectedToAuth) {
+    const err = new Error(
+      `Security assertion failed: Application accepted invalid credentials and redirected to authenticated area (${currentUrl}).`
+    );
+    err.statusType = 'FAIL';
+    throw err;
+  }
+
+  // 3. Evaluate results
+  if (observedErrorText) {
+    return {
+      expected:
+        step.expected ||
+        'Observable authentication error displayed or user remains unauthenticated on login page',
+      actual: `Observable authentication error displayed: "${observedErrorText}"`,
+    };
+  }
+
+  // If requireErrorMessage is explicitly set and no message appeared
+  if (step.requireErrorMessage === true) {
+    const err = new Error(
+      'Observable authentication error message was not displayed after submitting invalid credentials.'
+    );
+    err.statusType = 'FAIL';
+    throw err;
+  }
+
+  // Check that user is still on login page and controls remain
+  const info = await inspectPageType(page);
+  if (info.isLoginPage || info.hasLoginFormControls) {
+    return {
+      expected:
+        step.expected ||
+        'Observable authentication error displayed or user remains unauthenticated on login page',
+      actual: `User remained unauthenticated on the login page (${currentUrl}); access was rejected without redirecting to authenticated area`,
+    };
+  }
+
+  const err = new Error(
+    `Invalid credentials submission did not show an error message and left the login page to "${currentUrl}".`
+  );
+  err.statusType = 'FAIL';
+  throw err;
+}
+
+/**
  * Attempts to resolve an element using the primary target and any fallback strategies.
  *
  * @param {import('playwright').Page} page
@@ -35,13 +339,15 @@ async function smartFindElement(page, step, timeout) {
   }
 
   const tried = candidates.map((c) => `${c.strategy}="${c.value || c.name || ''}"`).join(', ');
-  throw new Error(
+  const err = new Error(
     `Unable to locate accessible control for "${step.description || step.action}". Tried: [${tried}]. The page structure may require clarification or the element is not currently visible.`
   );
+  err.statusType = 'BLOCKED';
+  throw err;
 }
 
 /**
- * Executes a single AI test step with smart locator fallbacks and verification.
+ * Executes a single AI test step with smart locator fallbacks and functional verification.
  *
  * @param {import('playwright').Page} page
  * @param {object} step
@@ -56,17 +362,61 @@ async function executeAiStep(page, step, defaultTimeoutMs) {
       await page.goto(step.url, { waitUntil: 'domcontentloaded', timeout });
       const currentUrl = page.url();
       return {
-        expected: `Navigate to "${step.url}"`,
+        expected: step.expected || `Navigate to "${step.url}"`,
         actual: `Successfully landed on "${currentUrl}"`,
       };
     }
 
+    case 'ensureLoginPage': {
+      return await ensureLoginPage(page, step, timeout);
+    }
+
+    case 'assertInvalidLogin': {
+      return await assertInvalidLogin(page, step, timeout);
+    }
+
     case 'click': {
       const locator = await smartFindElement(page, step, timeout);
+      const prevUrl = page.url();
+
+      const isEnabled = await locator.isEnabled({ timeout: Math.min(timeout, 2000) }).catch(() => true);
+      if (!isEnabled) {
+        const err = new Error(`Target button/control is disabled and cannot be clicked.`);
+        err.statusType = 'BLOCKED';
+        throw err;
+      }
+
       await locator.click({ timeout });
+      await page.waitForTimeout(400);
+
+      const postUrl = page.url();
+      const urlChanged = postUrl !== prevUrl;
+
+      // Functional effect verification if specified
+      if (step.verifyEffect === 'urlChange' && !urlChanged) {
+        const err = new Error(
+          `Click completed but expected functional effect did not occur (URL remained "${prevUrl}").`
+        );
+        err.statusType = 'FAIL';
+        throw err;
+      }
+
+      if (step.expectedUrl && !postUrl.includes(step.expectedUrl)) {
+        const err = new Error(
+          `Click completed but expected URL "${step.expectedUrl}" was not reached (current: "${postUrl}").`
+        );
+        err.statusType = 'FAIL';
+        throw err;
+      }
+
+      let actual = 'Click dispatched successfully on enabled element';
+      if (urlChanged) {
+        actual = `Click dispatched; navigated from "${prevUrl}" to "${postUrl}"`;
+      }
+
       return {
-        expected: `Click element: ${step.description}`,
-        actual: `Element clicked successfully`,
+        expected: step.expected || `Click element: ${step.description}`,
+        actual,
       };
     }
 
@@ -75,7 +425,7 @@ async function executeAiStep(page, step, defaultTimeoutMs) {
       await locator.fill(String(step.value), { timeout });
       const displayVal = step.isSensitive ? '••••••••' : String(step.value);
       return {
-        expected: `Fill input with "${displayVal}"`,
+        expected: step.expected || `Fill input with "${displayVal}"`,
         actual: `Input filled with "${displayVal}"`,
       };
     }
@@ -84,7 +434,7 @@ async function executeAiStep(page, step, defaultTimeoutMs) {
       const locator = await smartFindElement(page, step, timeout);
       await locator.selectOption(String(step.value), { timeout });
       return {
-        expected: `Select option "${step.value}"`,
+        expected: step.expected || `Select option "${step.value}"`,
         actual: `Option "${step.value}" selected`,
       };
     }
@@ -92,7 +442,7 @@ async function executeAiStep(page, step, defaultTimeoutMs) {
     case 'assertVisible': {
       await smartFindElement(page, step, timeout);
       return {
-        expected: `Element is visible: ${step.description}`,
+        expected: step.expected || `Element is visible: ${step.description}`,
         actual: 'Element is visible on page as expected',
       };
     }
@@ -107,13 +457,15 @@ async function executeAiStep(page, step, defaultTimeoutMs) {
         : text.toLowerCase().includes(expectedText.toLowerCase());
 
       if (!matched) {
-        throw new Error(
+        const err = new Error(
           `Text verification failed. Expected "${expectedText}", but observed "${text.trim()}".`
         );
+        err.statusType = 'FAIL';
+        throw err;
       }
 
       return {
-        expected: `Element contains text "${expectedText}"`,
+        expected: step.expected || `Element contains text "${expectedText}"`,
         actual: `Observed text: "${text.trim()}"`,
       };
     }
@@ -126,13 +478,15 @@ async function executeAiStep(page, step, defaultTimeoutMs) {
         : currentUrl.toLowerCase().includes(expected.toLowerCase());
 
       if (!matched) {
-        throw new Error(
+        const err = new Error(
           `URL verification failed. Expected URL to include "${expected}", but current URL is "${currentUrl}".`
         );
+        err.statusType = 'FAIL';
+        throw err;
       }
 
       return {
-        expected: `URL matches "${expected}"`,
+        expected: step.expected || `URL matches "${expected}"`,
         actual: `Current URL is "${currentUrl}"`,
       };
     }
@@ -143,13 +497,15 @@ async function executeAiStep(page, step, defaultTimeoutMs) {
       const expectedCount = Number(step.value);
 
       if (count !== expectedCount) {
-        throw new Error(
+        const err = new Error(
           `Count assertion failed. Expected ${expectedCount} elements, but found ${count}.`
         );
+        err.statusType = 'FAIL';
+        throw err;
       }
 
       return {
-        expected: `Found ${expectedCount} elements`,
+        expected: step.expected || `Found ${expectedCount} elements`,
         actual: `Observed ${count} elements`,
       };
     }
@@ -158,7 +514,7 @@ async function executeAiStep(page, step, defaultTimeoutMs) {
       const buffer = await page.screenshot({ type: 'png', timeout });
       const base64 = `data:image/png;base64,${buffer.toString('base64')}`;
       return {
-        expected: 'Capture evidence screenshot of verified page state',
+        expected: step.expected || 'Capture evidence screenshot of verified page state',
         actual: 'Screenshot captured',
         screenshot: base64,
       };
@@ -179,14 +535,14 @@ async function executeAiStep(page, step, defaultTimeoutMs) {
  * @returns {Promise<object>} Complete execution report
  */
 export async function runAiTest(plan, startUrl, options = {}) {
-  // Handle blocked plans (e.g. safety violations or missing required credentials)
-  if (plan.status === 'blocked') {
+  // Handle blocked or unsupported plans
+  if (plan.status === 'blocked' || plan.status === 'unsupported') {
     return {
       testName: plan.objective || 'AI Website Test',
       startUrl,
       finalUrl: startUrl,
-      status: 'blocked',
-      blockedReason: plan.blockedReason || 'Test blocked by safety or prerequisite check.',
+      status: plan.status,
+      blockedReason: plan.blockedReason || plan.unsupportedReason || 'Test blocked by prerequisite or policy check.',
       objective: plan.objective,
       planner: plan.planner,
       missingCredentials: plan.missingCredentials || [],
@@ -196,6 +552,9 @@ export async function runAiTest(plan, startUrl, options = {}) {
       executedSteps: 0,
       passedSteps: 0,
       failedSteps: 0,
+      blockedSteps: 0,
+      errorSteps: 0,
+      skippedSteps: 0,
       steps: [],
       failure: null,
       pageDiagnostics: null,
@@ -273,8 +632,15 @@ export async function runAiTest(plan, startUrl, options = {}) {
     cdp.on('Fetch.requestPaused', async (event) => {
       const { requestId, request } = event;
       try {
+        let isSameOrigin = false;
+        try {
+          isSameOrigin = new URL(request.url).origin === new URL(startUrl).origin;
+        } catch {
+          isSameOrigin = false;
+        }
+
         const reqValidation = await validateUrl(request.url, {
-          allowLoopback: options.allowLocalForTesting && request.url.startsWith(startUrl),
+          allowLoopback: options.allowLocalForTesting && isSameOrigin,
         });
 
         if (!reqValidation.isValid) {
@@ -328,15 +694,46 @@ export async function runAiTest(plan, startUrl, options = {}) {
           id: step.id || `step-${stepIndex}`,
           action: step.action,
           description: step.description || `${step.action} action`,
-          status: 'passed',
+          status: 'PASS',
           durationMs,
-          expected: outcome.expected,
+          expected: step.expected || outcome.expected,
           actual: outcome.actual,
           screenshot: outcome.screenshot || null,
         });
       } catch (stepErr) {
         const durationMs = Date.now() - stepStartTime;
-        overallStatus = 'failed';
+
+        // Categorize the error status precisely
+        let stepStatus = 'FAIL';
+        if (step.action.startsWith('assert')) {
+          // Any assertion failure is FAIL
+          stepStatus = 'FAIL';
+        } else if (stepErr.statusType === 'BLOCKED') {
+          stepStatus = 'BLOCKED';
+        } else if (stepErr.statusType === 'FAIL') {
+          stepStatus = 'FAIL';
+        } else if (
+          stepErr.name === 'TimeoutError' ||
+          stepErr.message.includes('Timeout') ||
+          stepErr.message.includes('Target closed') ||
+          stepErr.message.includes('browser has been closed')
+        ) {
+          stepStatus = 'ERROR';
+        } else if (
+          stepErr.message.includes('Unable to locate') ||
+          stepErr.message.includes('Target button/control is disabled')
+        ) {
+          stepStatus = 'BLOCKED';
+        } else {
+          stepStatus = 'ERROR';
+        }
+
+        // Set overall status based on highest severity
+        if (stepStatus === 'FAIL' || stepStatus === 'ERROR') {
+          overallStatus = 'failed';
+        } else if (stepStatus === 'BLOCKED' && overallStatus !== 'failed') {
+          overallStatus = 'blocked';
+        }
 
         // Capture failure evidence screenshot
         let failScreenshot = null;
@@ -351,22 +748,42 @@ export async function runAiTest(plan, startUrl, options = {}) {
           stepIndex,
           stepId: step.id || `step-${stepIndex}`,
           action: step.action,
+          status: stepStatus,
           message: stepErr.message,
         };
+
+        const prefix =
+          stepStatus === 'BLOCKED' ? 'Blocked: ' : stepStatus === 'ERROR' ? 'Error: ' : 'Failed: ';
 
         stepResults.push({
           stepIndex,
           id: step.id || `step-${stepIndex}`,
           action: step.action,
           description: step.description || `${step.action} action`,
-          status: 'failed',
+          status: stepStatus,
           durationMs,
-          expected: `Step ${step.action} executes and verifies successfully`,
-          actual: `Failed: ${stepErr.message}`,
+          expected: step.expected || `Step ${step.action} executes and verifies successfully`,
+          actual: `${prefix}${stepErr.message}`,
           screenshot: failScreenshot,
         });
 
-        // Halt on step failure
+        // Record all subsequent dependent steps as SKIPPED
+        for (let j = i + 1; j < plan.steps.length; j++) {
+          const depStep = plan.steps[j];
+          stepResults.push({
+            stepIndex: j + 1,
+            id: depStep.id || `step-${j + 1}`,
+            action: depStep.action,
+            description: depStep.description || `${depStep.action} action`,
+            status: 'SKIPPED',
+            durationMs: 0,
+            expected: depStep.expected || `Step ${depStep.action} executes after prerequisites pass`,
+            actual: `Skipped: Prerequisite Step ${stepIndex} (${step.action}) did not succeed (${stepStatus}: ${stepErr.message})`,
+            screenshot: null,
+          });
+        }
+
+        // Halt on step failure/block/error
         break;
       }
     }
@@ -374,21 +791,30 @@ export async function runAiTest(plan, startUrl, options = {}) {
     const totalDurationMs = Date.now() - testStartTime;
     const finalUrl = page.url();
 
+    const passedCount = stepResults.filter((s) => s.status === 'PASS' || s.status === 'passed').length;
+    const failedCount = stepResults.filter((s) => s.status === 'FAIL' || s.status === 'failed').length;
+    const blockedCount = stepResults.filter((s) => s.status === 'BLOCKED' || s.status === 'blocked').length;
+    const errorCount = stepResults.filter((s) => s.status === 'ERROR' || s.status === 'error').length;
+    const skippedCount = stepResults.filter((s) => s.status === 'SKIPPED' || s.status === 'skipped').length;
+
     return {
       testName: plan.objective || 'AI Website Test',
       startUrl,
       finalUrl,
       status: overallStatus,
-      blockedReason: plan.blockedReason || null,
+      blockedReason: plan.blockedReason || (overallStatus === 'blocked' ? failureDetail?.message : null),
       objective: plan.objective,
       planner: plan.planner,
       missingCredentials: plan.missingCredentials || [],
       prohibitedActions: plan.prohibitedActions || [],
       durationMs: totalDurationMs,
       totalSteps: plan.steps.length,
-      executedSteps: stepResults.length,
-      passedSteps: stepResults.filter((s) => s.status === 'passed').length,
-      failedSteps: stepResults.filter((s) => s.status === 'failed').length,
+      executedSteps: stepResults.filter((s) => s.status !== 'SKIPPED' && s.status !== 'skipped').length,
+      passedSteps: passedCount,
+      failedSteps: failedCount,
+      blockedSteps: blockedCount,
+      errorSteps: errorCount,
+      skippedSteps: skippedCount,
       steps: stepResults,
       failure: failureDetail,
       pageDiagnostics,

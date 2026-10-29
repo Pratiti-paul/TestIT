@@ -9,6 +9,8 @@ export const ALLOWED_ACTIONS = [
   'assertText',
   'assertUrl',
   'assertCount',
+  'assertInvalidLogin',
+  'ensureLoginPage',
   'screenshot',
 ];
 
@@ -252,8 +254,10 @@ export async function validateTestDefinition(definition, options = {}) {
           break;
         }
 
+        case 'assertInvalidLogin':
+        case 'ensureLoginPage':
         case 'screenshot':
-          // Optional name check
+          // Optional target or metadata
           break;
       }
     }
