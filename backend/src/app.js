@@ -5,11 +5,22 @@ import scanRoutes from './routes/scanRoutes.js';
 
 const app = express();
 
-// CORS configuration
-const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+// CORS configuration: allow configured FRONTEND_URL and local Vite development ports (5173, 5174, etc.)
+const allowedOriginPattern = /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/;
+const configuredFrontend = process.env.FRONTEND_URL;
+
 app.use(
   cors({
-    origin: frontendUrl,
+    origin: (origin, callback) => {
+      // Allow requests with no origin (e.g. mobile apps, curl, server-to-server)
+      if (!origin) return callback(null, true);
+
+      if (origin === configuredFrontend || allowedOriginPattern.test(origin)) {
+        return callback(null, true);
+      }
+
+      return callback(null, false);
+    },
     credentials: true,
   })
 );
