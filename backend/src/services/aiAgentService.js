@@ -108,7 +108,11 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
   const maxSteps = options.maxSteps || 15;
   const stepTimeout = options.stepTimeoutMs || 6000;
 
-  let overallOutcome = 'PASS';
+  const objectiveOutcomes = new Map();
+  const failedObjectiveIds = new Set();
+  let authFailed = false;
+  let authSucceeded = false;
+  let fatalError = null;
   let failureAnalysis = null;
   let blockedReason = null;
 
@@ -171,18 +175,111 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
       screenshot: null,
     });
 
-    // Action loop tracking for loop detection
-    const recentActionSignatures = [];
+    // Hook for simulating fatal browser disconnection in unit tests
+    if (options.simulateFatalBrowserCrash) {
+      await browser.close().catch(() => {});
+    }
 
     // 5. Execute Observe-Plan-Act-Verify loop across planned objectives
-    for (const objective of plannedObjectives) {
-      if (overallOutcome !== 'PASS') break;
+    for (let objIdx = 0; objIdx < plannedObjectives.length; objIdx++) {
+      const objective = plannedObjectives[objIdx];
+      const objId = objective.id || `obj-${objIdx + 1}`;
 
+      // Check global step limit
+      if (currentStepIndex > maxSteps) {
+        executionSteps.push({
+          stepIndex: currentStepIndex++,
+          objectiveId: objId,
+          action: 'skip',
+          description: `Skip objective: ${objective.description}`,
+          status: 'SKIPPED',
+          durationMs: 0,
+          expected: objective.expectedOutcome || 'Step skipped due to step limit',
+          actual: `Skipped: Maximum step limit (${maxSteps}) reached.`,
+          screenshot: null,
+        });
+        objectiveOutcomes.set(objId, 'SKIPPED');
+        failedObjectiveIds.add(objId);
+        continue;
+      }
+
+      // Check objective dependencies and prerequisites
+      const depCheck = checkObjectiveDependencies(objective, {
+        failedObjectiveIds,
+        authFailed,
+        authSucceeded,
+        credentials,
+      });
+
+      if (!depCheck.canRun) {
+        executionSteps.push({
+          stepIndex: currentStepIndex++,
+          objectiveId: objId,
+          action: 'skip',
+          description: `Skip objective: ${objective.description}`,
+          status: 'SKIPPED',
+          durationMs: 0,
+          expected: objective.expectedOutcome || 'Step skipped due to unfulfilled dependency',
+          actual: depCheck.reason,
+          screenshot: null,
+        });
+        objectiveOutcomes.set(objId, 'SKIPPED');
+        failedObjectiveIds.add(objId);
+        continue;
+      }
+
+      // Action loop tracking for loop detection within this objective
+      const recentActionSignatures = [];
       let objectiveFinished = false;
+      let objectiveOutcome = 'PASS';
+      let objectiveFailure = null;
+      let actionCountInObjective = 0;
 
       while (!objectiveFinished && currentStepIndex <= maxSteps) {
+        // Fatal browser disconnection check
+        if (!browser || !browser.isConnected() || !page || page.isClosed()) {
+          fatalError = new Error('Browser or page closed unexpectedly');
+          objectiveOutcome = 'ERROR';
+          objectiveFailure = {
+            description: 'Fatal browser error: browser disconnected or page closed.',
+            hypothesis: 'Playwright browser crash or unrecoverable system exception.',
+          };
+          executionSteps.push({
+            stepIndex: currentStepIndex++,
+            objectiveId: objId,
+            action: 'error',
+            description: `Fatal error during objective: ${objective.description}`,
+            status: 'ERROR',
+            durationMs: 0,
+            expected: objective.expectedOutcome || 'Objective execution',
+            actual: 'Fatal error: Browser disconnected or page closed.',
+            screenshot: null,
+          });
+          break;
+        }
+
         // Step 1: OBSERVE
-        const observation = await observePage(page, { consoleErrors });
+        let observation;
+        try {
+          observation = await observePage(page, { consoleErrors });
+        } catch (obsErr) {
+          if (!browser.isConnected() || page.isClosed()) {
+            fatalError = obsErr;
+            objectiveOutcome = 'ERROR';
+            objectiveFailure = {
+              description: `Fatal error observing page: ${obsErr.message}`,
+              hypothesis: 'Browser disconnected or page closed.',
+            };
+            break;
+          }
+          objectiveOutcome = 'ERROR';
+          objectiveFailure = {
+            description: `Failed to observe page state: ${obsErr.message}`,
+            hypothesis: 'Page navigation or DOM rendering interruption.',
+          };
+          objectiveFinished = true;
+          break;
+        }
 
         // Step 2: PLAN / DECIDE NEXT STEP
         let decision;
@@ -196,41 +293,64 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
             maxSteps,
           });
         } catch (planErr) {
-          overallOutcome = 'ERROR';
-          failureAnalysis = {
+          objectiveOutcome = 'ERROR';
+          objectiveFailure = {
             description: `AI Provider failed while deciding step ${currentStepIndex}: ${planErr.message}`,
             hypothesis: 'Model service error, rate limit, or invalid response format.',
           };
+          objectiveFinished = true;
           break;
         }
 
         // Validate decision schema
         const decisionCheck = validateAgentDecision(decision);
         if (!decisionCheck.valid) {
-          overallOutcome = 'ERROR';
-          failureAnalysis = {
+          objectiveOutcome = 'ERROR';
+          objectiveFailure = {
             description: `Model returned an invalid action schema: ${decisionCheck.error}`,
             hypothesis: 'Model output did not conform to the strict agent schema.',
           };
+          objectiveFinished = true;
           break;
         }
 
         // Handle conclusion
         if (decision.action === 'conclude') {
           objectiveFinished = true;
-          const conclusion = decision.conclude;
-          if (conclusion.outcome === 'FAIL') {
-            overallOutcome = 'FAIL';
-            failureAnalysis = conclusion.failureAnalysis || {
-              description: conclusion.reasoning,
+          const conclusion = decision.conclude || {};
+          const concludeStatus =
+            conclusion.outcome === 'FAIL'
+              ? 'FAIL'
+              : conclusion.outcome === 'BLOCKED'
+              ? 'BLOCKED'
+              : conclusion.outcome === 'NEEDS_CLARIFICATION'
+              ? 'BLOCKED'
+              : 'PASS';
+
+          objectiveOutcome = concludeStatus;
+
+          if (concludeStatus === 'FAIL') {
+            objectiveFailure = conclusion.failureAnalysis || {
+              description: conclusion.reasoning || 'Objective verification failed.',
               hypothesis: 'Behavior asserted by test objective was not satisfied.',
             };
-          } else if (conclusion.outcome === 'BLOCKED') {
-            overallOutcome = 'BLOCKED';
-            blockedReason = conclusion.reasoning;
-          } else if (conclusion.outcome === 'NEEDS_CLARIFICATION') {
-            overallOutcome = 'NEEDS_CLARIFICATION';
-            blockedReason = conclusion.reasoning;
+          } else if (concludeStatus === 'BLOCKED') {
+            objectiveFailure = { description: conclusion.reasoning };
+            if (!blockedReason) blockedReason = conclusion.reasoning;
+          }
+
+          if (concludeStatus !== 'PASS' || actionCountInObjective === 0) {
+            executionSteps.push({
+              stepIndex: currentStepIndex++,
+              objectiveId: objId,
+              action: 'conclude',
+              description: decision.thought || `Conclude objective: ${conclusion.reasoning || objective.description}`,
+              status: concludeStatus,
+              durationMs: 10,
+              expected: objective.expectedOutcome || 'Objective completed',
+              actual: conclusion.reasoning || `Concluded with status ${concludeStatus}`,
+              screenshot: null,
+            });
           }
           break;
         }
@@ -245,12 +365,17 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
           recentActionSignatures[0] === actionSig &&
           recentActionSignatures[1] === actionSig
         ) {
-          overallOutcome = 'BLOCKED';
-          blockedReason = `Agent loop detected: Action "${decision.action}" repeated 3 times without advancing state.`;
+          objectiveOutcome = 'BLOCKED';
+          objectiveFailure = {
+            description: `Agent loop detected: Action "${decision.action}" repeated 3 times without advancing state.`,
+          };
+          if (!blockedReason) blockedReason = objectiveFailure.description;
+          objectiveFinished = true;
           break;
         }
 
         // Step 3: ACT & VERIFY
+        actionCountInObjective++;
         const stepStart = Date.now();
         let stepStatus = 'PASS';
         let stepActual = '';
@@ -268,32 +393,52 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
             stepScreenshot = actResult.screenshot;
           }
         } catch (actErr) {
+          if (!browser || !browser.isConnected() || (page && page.isClosed())) {
+            fatalError = actErr;
+            stepStatus = 'ERROR';
+            stepActual = `Fatal browser disconnection: ${actErr.message}`;
+            objectiveOutcome = 'ERROR';
+            objectiveFailure = {
+              description: `Fatal infrastructure error: ${actErr.message}`,
+              hypothesis: 'Browser crashed or was terminated.',
+            };
+            objectiveFinished = true;
+            executionSteps.push({
+              stepIndex: currentStepIndex++,
+              objectiveId: objId,
+              action: decision.action,
+              description: decision.thought || `Execute action: ${decision.action}`,
+              status: stepStatus,
+              durationMs: Date.now() - stepStart,
+              expected: decision.expectedOutcome || `Execute ${decision.action} successfully`,
+              actual: stepActual,
+              screenshot: null,
+            });
+            break;
+          }
+
           stepStatus = actErr.statusType || 'FAIL';
           stepActual = actErr.message;
-
-          // Capture failure screenshot
           stepScreenshot = await captureSafeScreenshot(page);
 
+          objectiveOutcome = stepStatus;
+          objectiveFinished = true;
+
           if (stepStatus === 'FAIL') {
-            overallOutcome = 'FAIL';
-            failureAnalysis = {
+            objectiveFailure = {
               description: `Verification failed at step ${currentStepIndex}: ${actErr.message}`,
               expected: decision.expectedOutcome || decision.action,
               actual: actErr.message,
               hypothesis: 'The application did not exhibit the expected functional behavior.',
             };
-            objectiveFinished = true;
           } else if (stepStatus === 'BLOCKED') {
-            overallOutcome = 'BLOCKED';
-            blockedReason = actErr.message;
-            objectiveFinished = true;
+            objectiveFailure = { description: actErr.message };
+            if (!blockedReason) blockedReason = actErr.message;
           } else {
-            overallOutcome = 'ERROR';
-            failureAnalysis = {
+            objectiveFailure = {
               description: `Infrastructure or execution error: ${actErr.message}`,
               hypothesis: 'Timeout or network disconnection.',
             };
-            objectiveFinished = true;
           }
         }
 
@@ -301,6 +446,7 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
 
         executionSteps.push({
           stepIndex: currentStepIndex++,
+          objectiveId: objId,
           action: decision.action,
           description: decision.thought || `Execute action: ${decision.action}`,
           status: stepStatus,
@@ -310,15 +456,63 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
           screenshot: stepScreenshot,
         });
 
-        if (overallOutcome !== 'PASS') {
+        if (objectiveFinished || objectiveOutcome !== 'PASS') {
           break;
         }
+      } // end while
+
+      // Record outcome for this objective
+      objectiveOutcomes.set(objId, objectiveOutcome);
+
+      if (objectiveOutcome !== 'PASS') {
+        failedObjectiveIds.add(objId);
+        if (!failureAnalysis && objectiveFailure) {
+          failureAnalysis = objectiveFailure;
+        }
+      }
+
+      // Check if this objective was testing authentication
+      const isAuthObjective =
+        objective.isAuthGate === true ||
+        (objective.targetBehavior && /login|auth/i.test(objective.targetBehavior)) ||
+        (objective.description && /login|sign\s*in|authenticate/i.test(objective.description));
+
+      if (isAuthObjective) {
+        if (objectiveOutcome === 'PASS') {
+          authSucceeded = true;
+          authFailed = false;
+        } else {
+          authFailed = true;
+          authSucceeded = false;
+        }
+      }
+
+      // If fatal error occurred, abort remaining objectives and record them as SKIPPED
+      if (fatalError) {
+        for (let remIdx = objIdx + 1; remIdx < plannedObjectives.length; remIdx++) {
+          const remObj = plannedObjectives[remIdx];
+          const remId = remObj.id || `obj-${remIdx + 1}`;
+          executionSteps.push({
+            stepIndex: currentStepIndex++,
+            objectiveId: remId,
+            action: 'skip',
+            description: `Skip objective: ${remObj.description}`,
+            status: 'SKIPPED',
+            durationMs: 0,
+            expected: remObj.expectedOutcome || 'Step skipped due to fatal infrastructure error',
+            actual: `Skipped: Execution aborted due to fatal infrastructure error: ${fatalError.message}`,
+            screenshot: null,
+          });
+          objectiveOutcomes.set(remId, 'SKIPPED');
+          failedObjectiveIds.add(remId);
+        }
+        break;
       }
     }
 
     // Capture final evidence screenshot if none captured yet
     const hasScreenshot = executionSteps.some((s) => s.screenshot);
-    if (!hasScreenshot && page) {
+    if (!hasScreenshot && page && !page.isClosed()) {
       const finalShot = await captureSafeScreenshot(page);
       executionSteps.push({
         stepIndex: currentStepIndex++,
@@ -332,13 +526,34 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
       });
     }
   } catch (err) {
-    overallOutcome = 'ERROR';
-    failureAnalysis = {
-      description: `Critical agent runner error: ${err.message}`,
-      hypothesis: 'Playwright browser crash or unrecoverable system exception.',
-    };
+    fatalError = err;
+    if (!failureAnalysis) {
+      failureAnalysis = {
+        description: `Critical agent runner error: ${err.message}`,
+        hypothesis: 'Playwright browser crash or unrecoverable system exception.',
+      };
+    }
+    // Record any unexecuted objectives in executionSteps so they are never silently omitted
+    for (const obj of plannedObjectives) {
+      const objId = obj.id || `obj-${executionSteps.length + 1}`;
+      if (!executionSteps.some((s) => s.objectiveId === objId)) {
+        executionSteps.push({
+          stepIndex: currentStepIndex++,
+          objectiveId: objId,
+          action: 'skip',
+          description: `Skip objective: ${obj.description}`,
+          status: 'SKIPPED',
+          durationMs: 0,
+          expected: obj.expectedOutcome || 'Step skipped due to fatal runner error',
+          actual: `Skipped: Browser initialization or system failure: ${err.message}`,
+          screenshot: null,
+        });
+        objectiveOutcomes.set(objId, 'SKIPPED');
+        failedObjectiveIds.add(objId);
+      }
+    }
   } finally {
-    if (page) await page.close().catch(() => {});
+    if (page && !page.isClosed()) await page.close().catch(() => {});
     if (context) await context.close().catch(() => {});
     if (browser) await browser.close().catch(() => {});
   }
@@ -351,21 +566,37 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
   const errorSteps = executionSteps.filter((s) => s.status === 'ERROR').length;
   const skippedSteps = executionSteps.filter((s) => s.status === 'SKIPPED').length;
 
-  const finalStatus =
-    overallOutcome === 'PASS'
-      ? 'passed'
-      : overallOutcome === 'FAIL'
-      ? 'failed'
-      : overallOutcome === 'BLOCKED'
-      ? 'blocked'
-      : overallOutcome === 'NEEDS_CLARIFICATION'
-      ? 'unsupported'
-      : 'error';
+  const allOutcomes = Array.from(objectiveOutcomes.values());
+  let finalStatus;
+
+  if (fatalError) {
+    finalStatus = 'error';
+  } else if (allOutcomes.includes('FAIL') || executionSteps.some((s) => s.status === 'FAIL')) {
+    finalStatus = 'failed';
+  } else if (allOutcomes.includes('ERROR') || executionSteps.some((s) => s.status === 'ERROR')) {
+    finalStatus = 'error';
+  } else if (allOutcomes.includes('BLOCKED')) {
+    finalStatus = allOutcomes.includes('PASS') ? 'partial' : 'blocked';
+  } else if (allOutcomes.includes('SKIPPED')) {
+    finalStatus = allOutcomes.includes('PASS') ? 'partial' : 'blocked';
+  } else if (allOutcomes.includes('NEEDS_CLARIFICATION')) {
+    finalStatus = 'unsupported';
+  } else {
+    finalStatus = 'passed';
+  }
+
+  if (!failureAnalysis && failedSteps > 0) {
+    const firstFailed = executionSteps.find((s) => s.status === 'FAIL');
+    failureAnalysis = {
+      description: firstFailed?.actual || 'One or more test objectives failed verification.',
+      hypothesis: 'The application did not exhibit the expected functional behavior.',
+    };
+  }
 
   return {
     testName: `AI QA Test: ${trimmedInstructions.slice(0, 100)}`,
     startUrl: trimmedUrl,
-    finalUrl: page ? page.url() : trimmedUrl,
+    finalUrl: page && !page.isClosed() ? page.url() : trimmedUrl,
     status: finalStatus,
     blockedReason,
     objective: trimmedInstructions,
@@ -380,7 +611,7 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
     prohibitedActions: [],
     durationMs: Date.now() - startTime,
     totalSteps,
-    executedSteps: totalSteps,
+    executedSteps: totalSteps - skippedSteps,
     passedSteps,
     failedSteps,
     blockedSteps,
@@ -394,9 +625,23 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
       loadTimeMs: executionSteps[0]?.durationMs || 0,
     },
     coverageAndLimitations: {
-      tested: plannedObjectives.map((o) => o.description).join('; ') || trimmedInstructions,
-      notTested: 'Live financial payments, destructive deletions, and third-party external origins',
-      missingPrerequisites: credentials?.username ? [] : ['None (Public / Unauthenticated scope)'],
+      tested:
+        plannedObjectives
+          .filter((o) => {
+            const outcome = objectiveOutcomes.get(o.id || '');
+            return outcome === 'PASS' || outcome === 'FAIL';
+          })
+          .map((o) => o.description)
+          .join('; ') || 'None',
+      notTested:
+        plannedObjectives
+          .filter((o) => {
+            const outcome = objectiveOutcomes.get(o.id || '');
+            return outcome === 'SKIPPED' || outcome === 'BLOCKED' || outcome === 'ERROR' || !outcome;
+          })
+          .map((o) => `${o.description} (${objectiveOutcomes.get(o.id || '') || 'UNEXECUTED'})`)
+          .join('; ') || 'None',
+      missingPrerequisites: authFailed ? ['Authentication (Login verification failed)'] : [],
       ambiguousExpectations: null,
       executionLimitations: `Bounded to maximum ${maxSteps} actions per journey for safety.`,
     },
@@ -545,10 +790,87 @@ async function resolveAgentLocator(page, target, timeout) {
 }
 
 /**
+ * Evaluates whether an objective can execute or must be skipped due to unfulfilled prerequisites.
+ *
+ * @param {object} objective
+ * @param {object} state
+ * @param {Set<string>} state.failedObjectiveIds
+ * @param {boolean} state.authFailed
+ * @param {boolean} state.authSucceeded
+ * @param {object} state.credentials
+ * @returns {{ canRun: boolean, reason?: string }}
+ */
+export function checkObjectiveDependencies(objective, { failedObjectiveIds, authFailed, authSucceeded, credentials }) {
+  if (!objective || typeof objective !== 'object') {
+    return { canRun: true };
+  }
+
+  // 1. Explicit dependsOn: string ID or array of objective IDs
+  const dependsOn = Array.isArray(objective.dependsOn)
+    ? objective.dependsOn
+    : objective.dependsOn
+    ? [objective.dependsOn]
+    : [];
+
+  for (const depId of dependsOn) {
+    if (failedObjectiveIds.has(depId)) {
+      return {
+        canRun: false,
+        reason: `Skipped: Prerequisite objective "${depId}" failed or was not satisfied.`,
+      };
+    }
+  }
+
+  // 2. Preconditions referencing objective IDs
+  if (Array.isArray(objective.preconditions)) {
+    for (const p of objective.preconditions) {
+      if (typeof p === 'string' && failedObjectiveIds.has(p)) {
+        return {
+          canRun: false,
+          reason: `Skipped: Prerequisite objective "${p}" failed or was not satisfied.`,
+        };
+      }
+    }
+  }
+
+  // 3. Authentication prerequisites
+  const requiresAuth =
+    objective.requiresAuth === true ||
+    (Array.isArray(objective.preconditions) &&
+      objective.preconditions.some((p) => {
+        const pLower = String(p).toLowerCase();
+        return (
+          pLower.includes('auth') ||
+          pLower.includes('login') ||
+          pLower.includes('credential') ||
+          pLower.includes('logged in')
+        );
+      }));
+
+  if (requiresAuth) {
+    if (authFailed) {
+      return {
+        canRun: false,
+        reason: 'Skipped: Requires an authenticated session, but earlier authentication verification failed.',
+      };
+    }
+
+    if (!credentials?.username && !credentials?.password && !authSucceeded) {
+      return {
+        canRun: false,
+        reason: 'Skipped: Requires an authenticated session, but no test account credentials were provided.',
+      };
+    }
+  }
+
+  return { canRun: true };
+}
+
+/**
  * Captures base64 screenshot safely.
  */
 async function captureSafeScreenshot(page) {
-  if (!page) return null;
+  if (!page || page.isClosed()) return null;
   try {
     const buffer = await page.screenshot({ type: 'png', timeout: 3000 });
     return `data:image/png;base64,${buffer.toString('base64')}`;

@@ -135,6 +135,31 @@ export function generateDeterministicPlan({ url, instructions, credentials = {} 
     lower.includes('time') ||
     lower.includes('meal');
 
+  // If no testing instructions were provided
+  if (!text) {
+    return {
+      status: 'unsupported',
+      unsupportedReason: 'No testing instructions provided.',
+      objective: 'No instructions provided',
+      instructions: '',
+      userInstructions: '',
+      steps: [],
+    };
+  }
+
+  // If the instructions describe a flow the deterministic fallback cannot reliably plan without an LLM
+  if (!testsLogin && !testsSearch && !testsCart && !testsDate) {
+    return {
+      status: 'unsupported',
+      unsupportedReason:
+        `The deterministic fallback engine cannot reliably interpret or plan this custom objective ("${text.length > 80 ? text.slice(0, 80) + '...' : text}") without an AI model. Live AI planning (configured via GEMINI_API_KEY or OPENAI_API_KEY in backend/.env) or a supported user flow (login, search, cart, or date synchronization) is required.`,
+      objective: `Unsupported objective: ${text}`,
+      instructions: text,
+      userInstructions: text,
+      steps: [],
+    };
+  }
+
   // Step 1: Always navigate to the starting page
   steps.push({
     id: 'step-1',
@@ -548,25 +573,6 @@ export function generateDeterministicPlan({ url, instructions, credentials = {} 
     });
   }
 
-  // 5. Check for General content inspection (when not login, search, cart, or date)
-  const isCustomGeneral = !testsLogin && !testsSearch && !testsCart && !testsDate && text.length > 0;
-  if (isCustomGeneral) {
-    steps.push({
-      id: `step-${stepCounter++}`,
-      action: 'assertVisible',
-      target: {
-        strategy: 'css',
-        value: 'header, nav, main, h1, body',
-      },
-      fallbacks: [
-        { strategy: 'css', value: 'body' },
-      ],
-      description: `Inspect page structure and verify main interface for: "${text.slice(0, 80)}"`,
-      expected: 'Target website main interface is rendered and visible',
-      timeoutMs: 5000,
-    });
-  }
-
   // Final screenshot step for visual confirmation
   steps.push({
     id: `step-${stepCounter++}`,
@@ -577,7 +583,10 @@ export function generateDeterministicPlan({ url, instructions, credentials = {} 
   });
 
   return {
+    status: 'ready',
     objective: `Test user journey: ${text.slice(0, 120)}...`,
+    instructions: text,
+    userInstructions: text,
     steps: steps.slice(0, 25), // Enforce 25 step limit
   };
 }
@@ -704,13 +713,15 @@ export async function planAiTest({ url, instructions, credentials = {} }) {
       blockedReason: fallbackPlan.unsupportedReason,
       missingCredentials: [],
       prohibitedActions: [],
+      instructions: instructions.trim(),
+      userInstructions: instructions.trim(),
       planner: {
         mode: 'deterministic_fallback',
         provider: 'rule_based_engine',
         model: 'testit-rules-v1',
         aiConfigured: false,
         notice:
-          'No AI API key is configured and the instructions cannot be reliably planned by the deterministic fallback rules engine. Configure an AI API key (GEMINI_API_KEY or OPENAI_API_KEY) in backend/.env, or specify supported user flows (login, search, add to cart).',
+          'No AI API key is configured and the instructions cannot be reliably planned by the deterministic fallback rules engine. Configure an AI API key (GEMINI_API_KEY or OPENAI_API_KEY) in backend/.env, or specify supported user flows (login, search, add to cart, or date synchronization).',
       },
       objective: fallbackPlan.objective,
       steps: [],
@@ -722,6 +733,8 @@ export async function planAiTest({ url, instructions, credentials = {} }) {
     status: authCheck.requiresAuth && !authCheck.hasValidCredentials ? 'partial' : 'ready',
     missingCredentials: authCheck.missingCredentials,
     prohibitedActions: [],
+    instructions: instructions.trim(),
+    userInstructions: instructions.trim(),
     planner: {
       mode: 'deterministic_fallback',
       provider: 'rule_based_engine',

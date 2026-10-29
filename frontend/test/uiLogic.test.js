@@ -401,6 +401,55 @@ describe('Frontend UI Logic & Utilities', () => {
       }
     });
 
+    it('successfully handles unsupported test report and preserves user instructions', async () => {
+      const mockUnsupportedReport = {
+        testName: 'AI Website Test',
+        status: 'unsupported',
+        objective: 'Unsupported objective: Create a ticket and edit title',
+        instructions: 'Create a ticket and edit title',
+        userInstructions: 'Create a ticket and edit title',
+        blockedReason:
+          'The deterministic fallback engine cannot reliably interpret or plan this custom objective without an AI model.',
+        planner: { mode: 'deterministic_fallback', aiConfigured: false },
+        totalSteps: 0,
+        executedSteps: 0,
+        passedSteps: 0,
+        failedSteps: 0,
+        steps: [],
+      };
+
+      const mockBackend = http.createServer((req, res) => {
+        if (req.method === 'POST' && req.url === '/api/ai-tests/run') {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: true, data: mockUnsupportedReport }));
+        } else {
+          res.writeHead(404);
+          res.end();
+        }
+      });
+
+      await new Promise((resolve) => mockBackend.listen(0, '127.0.0.1', resolve));
+      const port = mockBackend.address().port;
+      process.env.VITE_API_BASE_URL = `http://127.0.0.1:${port}`;
+
+      try {
+        const report = await executeAiTest({
+          url: 'https://example.com',
+          instructions: 'Create a ticket and edit title',
+        });
+
+        assert.ok(report);
+        assert.equal(report.status, 'unsupported');
+        assert.equal(report.totalSteps, 0);
+        assert.equal(report.passedSteps, 0);
+        assert.match(report.blockedReason, /cannot reliably interpret or plan/i);
+        assert.equal(report.userInstructions, 'Create a ticket and edit title');
+        assert.deepEqual(report.steps, []);
+      } finally {
+        await new Promise((resolve) => mockBackend.close(resolve));
+      }
+    });
+
     it('rejects gracefully when backend returns HTTP error', async () => {
       const mockBackend = http.createServer((req, res) => {
         res.writeHead(400, { 'Content-Type': 'application/json' });

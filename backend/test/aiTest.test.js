@@ -193,6 +193,51 @@ describe('AI-Driven Website Testing Engine', () => {
       assert.ok(actions.includes('assertVisible'));
       assert.ok(actions.includes('screenshot'));
     });
+
+    it('marks unsupported custom objectives as unsupported without creating generic visibility steps', async () => {
+      const customObjectives = [
+        'Create a ticket, edit its title, and verify that the change persists.',
+        'Change a profile setting and verify it remains changed after reloading.',
+      ];
+
+      for (const instructions of customObjectives) {
+        // Direct deterministic plan check
+        const rawPlan = generateDeterministicPlan({
+          url: 'https://example.com',
+          instructions,
+        });
+
+        assert.equal(rawPlan.status, 'unsupported');
+        assert.equal(rawPlan.steps.length, 0);
+        assert.equal(rawPlan.userInstructions, instructions);
+        assert.match(rawPlan.unsupportedReason, /cannot reliably interpret or plan this custom objective/i);
+
+        // Verify full planAiTest wrapper returns structured unsupported outcome
+        const plan = await planAiTest({
+          url: 'https://example.com',
+          instructions,
+        });
+
+        assert.equal(plan.status, 'unsupported');
+        assert.equal(plan.steps.length, 0);
+        assert.equal(plan.userInstructions, instructions);
+        assert.match(plan.blockedReason, /without an AI model/i);
+        assert.equal(plan.planner.aiConfigured, false);
+        assert.equal(plan.planner.mode, 'deterministic_fallback');
+      }
+    });
+
+    it('preserves date synchronization as a supported deterministic flow', () => {
+      const plan = generateDeterministicPlan({
+        url: 'https://example.com',
+        instructions: 'Check date and day synchronization on the home screen',
+      });
+
+      assert.equal(plan.status, 'ready');
+      assert.ok(plan.steps.length > 0);
+      const actions = plan.steps.map((s) => s.action);
+      assert.ok(actions.includes('assertDateSync'));
+    });
   });
 
   describe('4. Real Browser Execution via Playwright', () => {
@@ -267,6 +312,27 @@ describe('AI-Driven Website Testing Engine', () => {
       assert.equal(report.status, 'blocked');
       assert.equal(report.blockedReason, 'Authentication credentials required');
       assert.equal(report.executedSteps, 0);
+      assert.deepEqual(report.steps, []);
+    });
+
+    it('handles unsupported plans immediately without launching browser and preserves instructions', async () => {
+      const unsupportedPlan = {
+        status: 'unsupported',
+        unsupportedReason: 'The deterministic fallback engine cannot reliably plan this custom journey without an AI model.',
+        objective: 'Unsupported objective: Create a ticket and edit title',
+        instructions: 'Create a ticket and edit title',
+        planner: { mode: 'deterministic_fallback', aiConfigured: false },
+        steps: [],
+      };
+
+      const report = await runAiTest(unsupportedPlan, 'https://example.com');
+      assert.equal(report.status, 'unsupported');
+      assert.match(report.blockedReason, /cannot reliably plan this custom journey/i);
+      assert.equal(report.totalSteps, 0);
+      assert.equal(report.executedSteps, 0);
+      assert.equal(report.passedSteps, 0);
+      assert.equal(report.failedSteps, 0);
+      assert.equal(report.userInstructions, 'Create a ticket and edit title');
       assert.deepEqual(report.steps, []);
     });
   });
@@ -346,6 +412,29 @@ describe('AI-Driven Website Testing Engine', () => {
       assert.equal(data.data.status, 'blocked');
       assert.match(data.data.blockedReason, /Authentication credentials required/i);
       assert.deepEqual(data.data.missingCredentials, ['Username / Email', 'Password']);
+    });
+
+    it('returns structured unsupported report with HTTP 200 for custom unhandled user flow', async () => {
+      const customInstruction = 'Create a ticket, edit its title, and verify that the change persists.';
+      const res = await fetch(`${apiBaseUrl}/api/ai-tests/run`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          url: 'https://example.com',
+          instructions: customInstruction,
+        }),
+      });
+
+      assert.equal(res.status, 200);
+      const data = await res.json();
+      assert.equal(data.success, true);
+      assert.equal(data.data.status, 'unsupported');
+      assert.match(data.data.blockedReason, /cannot reliably interpret or plan this custom objective/i);
+      assert.equal(data.data.totalSteps, 0);
+      assert.equal(data.data.passedSteps, 0);
+      assert.equal(data.data.failedSteps, 0);
+      assert.equal(data.data.userInstructions, customInstruction);
+      assert.deepEqual(data.data.steps, []);
     });
   });
 });

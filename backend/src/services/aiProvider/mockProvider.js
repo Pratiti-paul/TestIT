@@ -3,10 +3,11 @@
  */
 
 export class MockProvider {
-  constructor(customSteps = []) {
+  constructor(customSteps = [], customObjectives = null) {
     this.name = 'mock';
     this.model = 'mock-test-agent';
     this.customSteps = customSteps;
+    this.customObjectives = customObjectives;
     this.stepIndex = 0;
   }
 
@@ -15,7 +16,15 @@ export class MockProvider {
     this.stepIndex = 0;
   }
 
+  setObjectives(objectives) {
+    this.customObjectives = objectives;
+  }
+
   async planObjectives({ url, instructions }) {
+    if (Array.isArray(this.customObjectives) && this.customObjectives.length > 0) {
+      return { objectives: this.customObjectives };
+    }
+
     return {
       objectives: [
         {
@@ -30,10 +39,16 @@ export class MockProvider {
     };
   }
 
-  async decideNextStep({ objective, observation, history = [], stepNumber = 1 }) {
-    if (this.customSteps.length > 0 && this.stepIndex < this.customSteps.length) {
+  async decideNextStep({ objective, observation, history = [], stepNumber = 1, maxSteps = 15 }) {
+    if (typeof this.customSteps === 'function') {
+      const step = this.customSteps({ objective, observation, history, stepNumber, maxSteps });
+      if (step) return step;
+    }
+
+    if (Array.isArray(this.customSteps) && this.customSteps.length > 0 && this.stepIndex < this.customSteps.length) {
       const step = this.customSteps[this.stepIndex++];
-      return typeof step === 'function' ? step({ objective, observation, history, stepNumber }) : step;
+      const resolved = typeof step === 'function' ? step({ objective, observation, history, stepNumber, maxSteps }) : step;
+      if (resolved) return resolved;
     }
 
     // Default heuristic for mock when no custom sequence is provided

@@ -473,4 +473,333 @@ describe('Autonomous AI QA Agent Suite', () => {
       assert.match(report.blockedReason, /Agent loop detected/i);
     });
   });
+
+  describe('3. Multi-Objective Continuation & Dependency Handling', () => {
+    it('1. continues to a subsequent independent objective after an earlier objective fails', async () => {
+      const mockObjectives = [
+        {
+          id: 'obj-1',
+          description: 'Verify nonexistent promotional banner is present',
+          targetBehavior: 'Promotional banner assertion',
+          expectedOutcome: 'Promotional banner is visible',
+        },
+        {
+          id: 'obj-2',
+          description: 'Check whether the displayed weekday matches the date',
+          targetBehavior: 'Date synchronization',
+          expectedOutcome: 'Active day corresponds to system date',
+        },
+      ];
+
+      const mockSteps = ({ objective, stepNumber }) => {
+        if (objective.id === 'obj-1') {
+          return {
+            thought: 'Assert nonexistent promotional banner to test failure handling',
+            action: 'assertVisible',
+            target: { strategy: 'text', value: 'Nonexistent Special Promo 9999' },
+            expectedOutcome: 'Promo banner is visible',
+          };
+        }
+        if (objective.id === 'obj-2') {
+          if (stepNumber <= 2) {
+            return {
+              thought: 'Assert date synchronization with live calendar',
+              action: 'assertDateSync',
+              expectedOutcome: 'Date is synchronized with system clock',
+            };
+          }
+          return {
+            thought: 'Conclude date verification',
+            action: 'conclude',
+            conclude: { outcome: 'PASS', reasoning: 'Date synchronization successfully verified.' },
+          };
+        }
+      };
+
+      const report = await executeAiAgent(
+        {
+          url: `${baseUrl}/calendar-sync`,
+          instructions: 'Check promo banner and verify date synchronization.',
+        },
+        {
+          allowLocalForTesting: true,
+          allowMock: true,
+          mockObjectives,
+          mockSteps,
+          stepTimeoutMs: 1000,
+        }
+      );
+
+      // Status must remain 'failed' because obj-1 failed (never overwritten by obj-2 passing)
+      assert.equal(report.status, 'failed');
+      assert.equal(report.failedSteps, 1);
+      assert.ok(report.passedSteps >= 1);
+
+      // Both objectives must be represented in steps
+      const failedStep = report.steps.find((s) => s.status === 'FAIL' && s.objectiveId === 'obj-1');
+      assert.ok(failedStep, 'Objective 1 failure must be recorded');
+      assert.match(failedStep.actual, /Nonexistent Special Promo/i);
+
+      const passedStep = report.steps.find((s) => s.status === 'PASS' && s.objectiveId === 'obj-2');
+      assert.ok(passedStep, 'Objective 2 passed step must be recorded');
+
+      // Failure detail is preserved from the failed objective
+      assert.ok(report.failure);
+      assert.match(report.failure.description, /Verification failed/i);
+
+      // Coverage reflects both tested objectives
+      assert.match(report.coverageAndLimitations.tested, /Verify nonexistent promotional banner/i);
+      assert.match(report.coverageAndLimitations.tested, /Check whether the displayed weekday/i);
+    });
+
+    it('2. skips dependent objectives when an authentication prerequisite fails while continuing independent objectives', async () => {
+      const mockObjectives = [
+        {
+          id: 'obj-auth',
+          description: 'Attempt login and verify whether authentication succeeds',
+          targetBehavior: 'Authentication check',
+          isAuthGate: true,
+        },
+        {
+          id: 'obj-profile',
+          description: 'Inspect private user account profile and order history',
+          targetBehavior: 'Private profile inspection',
+          requiresAuth: true,
+        },
+        {
+          id: 'obj-calendar',
+          description: 'Check whether the displayed weekday matches the calendar date',
+          targetBehavior: 'Calendar synchronization',
+        },
+      ];
+
+      const mockSteps = ({ objective, stepNumber }) => {
+        if (objective.id === 'obj-auth') {
+          return {
+            thought: 'Simulate failed authentication attempt by asserting missing login success banner',
+            action: 'assertVisible',
+            target: { strategy: 'text', value: 'Welcome Back Authenticated User Dashboard' },
+            expectedOutcome: 'Logged-in dashboard is visible',
+          };
+        }
+        if (objective.id === 'obj-calendar') {
+          if (stepNumber <= 2) {
+            return {
+              thought: 'Verify active day synchronization independently',
+              action: 'assertDateSync',
+              expectedOutcome: 'Date matches current day',
+            };
+          }
+          return {
+            thought: 'Conclude calendar check as passed',
+            action: 'conclude',
+            conclude: { outcome: 'PASS', reasoning: 'Calendar verified.' },
+          };
+        }
+      };
+
+      const report = await executeAiAgent(
+        {
+          url: `${baseUrl}/calendar-sync`,
+          instructions: 'Login to portal, inspect profile, and check calendar date.',
+        },
+        {
+          allowLocalForTesting: true,
+          allowMock: true,
+          mockObjectives,
+          mockSteps,
+          stepTimeoutMs: 1000,
+        }
+      );
+
+      assert.equal(report.status, 'failed');
+      assert.equal(report.failedSteps, 1);
+      assert.equal(report.skippedSteps, 1);
+      assert.ok(report.passedSteps >= 1);
+
+      // obj-profile must be marked SKIPPED with clear explanation
+      const skippedStep = report.steps.find((s) => s.objectiveId === 'obj-profile');
+      assert.ok(skippedStep, 'Dependent objective step must exist with SKIPPED status');
+      assert.equal(skippedStep.status, 'SKIPPED');
+      assert.match(skippedStep.actual, /Requires an authenticated session, but earlier authentication verification failed/i);
+
+      // obj-calendar must be executed independently and PASS
+      const calendarStep = report.steps.find((s) => s.objectiveId === 'obj-calendar');
+      assert.ok(calendarStep, 'Independent calendar objective step must exist with PASS status');
+      assert.equal(calendarStep.status, 'PASS');
+
+      // Coverage reflects tested vs notTested
+      assert.match(report.coverageAndLimitations.tested, /Attempt login/i);
+      assert.match(report.coverageAndLimitations.notTested, /Inspect private user account profile.*\(SKIPPED\)/i);
+    });
+
+    it('3. preserves results when multiple independent objectives fail', async () => {
+      const mockObjectives = [
+        {
+          id: 'obj-fail-1',
+          description: 'Assert missing Header Element A',
+          targetBehavior: 'Header check',
+        },
+        {
+          id: 'obj-fail-2',
+          description: 'Assert missing Footer Element B',
+          targetBehavior: 'Footer check',
+        },
+      ];
+
+      const mockSteps = ({ objective }) => {
+        if (objective.id === 'obj-fail-1') {
+          return {
+            thought: 'Assert missing header',
+            action: 'assertVisible',
+            target: { strategy: 'text', value: 'MissingHeaderA_123' },
+          };
+        }
+        if (objective.id === 'obj-fail-2') {
+          return {
+            thought: 'Assert missing footer',
+            action: 'assertVisible',
+            target: { strategy: 'text', value: 'MissingFooterB_456' },
+          };
+        }
+      };
+
+      const report = await executeAiAgent(
+        {
+          url: `${baseUrl}/calendar-sync`,
+          instructions: 'Check header A and footer B',
+        },
+        {
+          allowLocalForTesting: true,
+          allowMock: true,
+          mockObjectives,
+          mockSteps,
+          stepTimeoutMs: 1000,
+        }
+      );
+
+      assert.equal(report.status, 'failed');
+      assert.equal(report.failedSteps, 2);
+      const fail1 = report.steps.find((s) => s.objectiveId === 'obj-fail-1' && s.status === 'FAIL');
+      const fail2 = report.steps.find((s) => s.objectiveId === 'obj-fail-2' && s.status === 'FAIL');
+      assert.ok(fail1, 'Objective 1 failure must be preserved');
+      assert.ok(fail2, 'Objective 2 failure must be preserved');
+      assert.match(fail1.actual, /MissingHeaderA_123/i);
+      assert.match(fail2.actual, /MissingFooterB_456/i);
+    });
+
+    it('4. accurately identifies unexecuted objectives as SKIPPED when a fatal infrastructure error occurs', async () => {
+      const mockObjectives = [
+        {
+          id: 'obj-1',
+          description: 'Initial objective during which browser terminates',
+          targetBehavior: 'Fatal crash handling',
+        },
+        {
+          id: 'obj-2',
+          description: 'Unreached Objective A',
+          targetBehavior: 'Post-crash objective',
+        },
+        {
+          id: 'obj-3',
+          description: 'Unreached Objective B',
+          targetBehavior: 'Post-crash objective',
+        },
+      ];
+
+      const report = await executeAiAgent(
+        {
+          url: `${baseUrl}/calendar-sync`,
+          instructions: 'Test fatal browser crash handling',
+        },
+        {
+          allowLocalForTesting: true,
+          allowMock: true,
+          mockObjectives,
+          mockSteps: [],
+          simulateFatalBrowserCrash: true,
+        }
+      );
+
+      assert.equal(report.status, 'error');
+      // obj-1 should be recorded as error
+      const errorStep = report.steps.find((s) => s.objectiveId === 'obj-1');
+      assert.ok(errorStep);
+      assert.equal(errorStep.status, 'ERROR');
+
+      // obj-2 and obj-3 must be explicitly marked as SKIPPED with fatal error notice
+      const skipped2 = report.steps.find((s) => s.objectiveId === 'obj-2');
+      const skipped3 = report.steps.find((s) => s.objectiveId === 'obj-3');
+      assert.ok(skipped2);
+      assert.ok(skipped3);
+      assert.equal(skipped2.status, 'SKIPPED');
+      assert.equal(skipped3.status, 'SKIPPED');
+      assert.match(skipped2.actual, /fatal infrastructure error/i);
+      assert.match(skipped3.actual, /fatal infrastructure error/i);
+
+      // notTested must list the unexecuted objectives
+      assert.match(report.coverageAndLimitations.notTested, /Unreached Objective A \(SKIPPED\)/i);
+      assert.match(report.coverageAndLimitations.notTested, /Unreached Objective B \(SKIPPED\)/i);
+    });
+
+    it('5. maintains accurate overall status: partial when an objective is blocked and another passes', async () => {
+      const mockObjectives = [
+        {
+          id: 'obj-blocked',
+          description: 'Access protected route that is blocked',
+          targetBehavior: 'Blocked barrier check',
+        },
+        {
+          id: 'obj-pass',
+          description: 'Check calendar date',
+          targetBehavior: 'Date check',
+        },
+      ];
+
+      const mockSteps = ({ objective, stepNumber }) => {
+        if (objective.id === 'obj-blocked') {
+          return {
+            thought: 'Identify login barrier and conclude blocked',
+            action: 'conclude',
+            conclude: {
+              outcome: 'BLOCKED',
+              reasoning: 'Authentication prerequisite missing: test credentials required.',
+            },
+          };
+        }
+        if (objective.id === 'obj-pass') {
+          if (stepNumber <= 2) {
+            return {
+              thought: 'Verify date synchronization',
+              action: 'assertDateSync',
+            };
+          }
+          return {
+            thought: 'Conclude date verification',
+            action: 'conclude',
+            conclude: { outcome: 'PASS', reasoning: 'Date verified.' },
+          };
+        }
+      };
+
+      const report = await executeAiAgent(
+        {
+          url: `${baseUrl}/calendar-sync`,
+          instructions: 'Inspect protected route and check calendar date.',
+        },
+        {
+          allowLocalForTesting: true,
+          allowMock: true,
+          mockObjectives,
+          mockSteps,
+        }
+      );
+
+      // Status must be partial because one passed and one was blocked
+      assert.equal(report.status, 'partial');
+      assert.equal(report.blockedSteps, 1);
+      assert.ok(report.passedSteps >= 1);
+      assert.equal(report.failedSteps, 0);
+    });
+  });
 });

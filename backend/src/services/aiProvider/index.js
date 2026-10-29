@@ -99,8 +99,11 @@ export function validateAgentDecision(decision) {
  * @returns {GeminiProvider | OpenAiProvider | MockProvider | null}
  */
 export function getActiveAiProvider(options = {}) {
-  if (options.allowMock && (options.mockSteps || process.env.TESTIT_USE_MOCK_AGENT === 'true')) {
-    return new MockProvider(options.mockSteps || []);
+  if (
+    options.allowMock &&
+    (options.mockSteps || options.mockObjectives || process.env.TESTIT_USE_MOCK_AGENT === 'true')
+  ) {
+    return new MockProvider(options.mockSteps || [], options.mockObjectives || null);
   }
 
   if (process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY.trim()) {
