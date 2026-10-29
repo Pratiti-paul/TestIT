@@ -1,6 +1,7 @@
 /**
  * Resolves the backend API base URL from Vite environment variables,
  * Node environment variables (during testing), or default fallback.
+ * Defaults to port 5001 to avoid the macOS ControlCenter / AirPlay Receiver conflict on 5000.
  *
  * @returns {string}
  */
@@ -8,9 +9,23 @@ export function getApiBaseUrl() {
   const envUrl =
     (typeof import.meta !== 'undefined' && import.meta.env?.VITE_API_BASE_URL) ||
     (typeof process !== 'undefined' && process.env?.VITE_API_BASE_URL) ||
-    'http://localhost:5000';
+    'http://localhost:5001';
 
   return envUrl.replace(/\/+$/, '');
+}
+
+/**
+ * Returns candidate base URLs to attempt if the configured URL suffers from a local port conflict.
+ * Only attempts fallback ports if the configured URL targets port 5000 (which conflicts with macOS AirPlay).
+ *
+ * @returns {string[]}
+ */
+export function getCandidateBaseUrls() {
+  const primary = getApiBaseUrl();
+  if (primary.includes(':5000')) {
+    return [primary, 'http://localhost:5001', 'http://127.0.0.1:5001', 'http://[::1]:5000'];
+  }
+  return [primary];
 }
 
 /**
@@ -21,44 +36,51 @@ export function getApiBaseUrl() {
  * @returns {Promise<object>} - Scan report data
  */
 export async function runWebsiteScan(url, signal) {
-  const baseUrl = getApiBaseUrl();
-  const endpoint = `${baseUrl}/api/scans/preview`;
+  const candidates = getCandidateBaseUrls();
+  let lastError = null;
 
-  let response;
-  try {
-    response = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ url }),
-      signal,
-    });
-  } catch (err) {
-    if (err.name === 'AbortError') {
-      throw new Error('Scan request was canceled.');
+  for (const baseUrl of candidates) {
+    const endpoint = `${baseUrl}/api/scans/preview`;
+    try {
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url }),
+        signal,
+      });
+
+      let data;
+      try {
+        data = await response.json();
+      } catch {
+        const parseErr = new Error(`Server returned an unparseable response (HTTP ${response.status}).`);
+        parseErr.status = response.status;
+        throw parseErr;
+      }
+
+      if (!response.ok || !data.success) {
+        const message = data?.message || `Scan failed with status code ${response.status}`;
+        const error = new Error(message);
+        error.code = data?.code || 'SCAN_ERROR';
+        error.status = response.status;
+        throw error;
+      }
+
+      return data.data;
+    } catch (err) {
+      if (err.name === 'AbortError') {
+        throw new Error('Scan request was canceled.');
+      }
+      if (err.status) {
+        throw err;
+      }
+      lastError = err;
     }
-    throw new Error(
-      `Unable to reach TestIT backend at ${baseUrl}. Ensure the backend server is running and accessible.`
-    );
   }
 
-  let data;
-  try {
-    data = await response.json();
-  } catch {
-    throw new Error(`Server returned an unparseable response (HTTP ${response.status}).`);
-  }
-
-  if (!response.ok || !data.success) {
-    const message = data?.message || `Scan failed with status code ${response.status}`;
-    const error = new Error(message);
-    error.code = data?.code || 'SCAN_ERROR';
-    error.status = response.status;
-    throw error;
-  }
-
-  return data.data;
+  throw new Error(
+    `Unable to reach TestIT backend at ${getApiBaseUrl()}. Ensure the backend server is running and accessible.`
+  );
 }
 
 /**
@@ -107,51 +129,61 @@ export async function validateFunctionalTest(definition) {
  * @returns {Promise<object>} Execution report
  */
 export async function executeFunctionalTest(definition, signal) {
-  const baseUrl = getApiBaseUrl();
-  const endpoint = `${baseUrl}/api/functional-tests/execute`;
+  const candidates = getCandidateBaseUrls();
+  let lastError = null;
 
-  let response;
-  try {
-    response = await fetch(endpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(definition),
-      signal,
-    });
-  } catch (err) {
-    if (err.name === 'AbortError') {
-      throw new Error('Functional test execution was canceled.');
+  for (const baseUrl of candidates) {
+    const endpoint = `${baseUrl}/api/functional-tests/execute`;
+    try {
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(definition),
+        signal,
+      });
+
+      let data;
+      try {
+        data = await response.json();
+      } catch {
+        const parseErr = new Error(`Server returned an unparseable response (HTTP ${response.status}).`);
+        parseErr.status = response.status;
+        throw parseErr;
+      }
+
+      if (!response.ok || !data.success) {
+        const message =
+          data?.errors && data.errors.length > 0
+            ? data.errors.join(' ')
+            : data?.message || `Test failed with status ${response.status}`;
+        const error = new Error(message);
+        error.status = response.status;
+        error.code = data?.code || 'TEST_ERROR';
+        error.errors = data?.errors;
+        throw error;
+      }
+
+      return data.data;
+    } catch (err) {
+      if (err.name === 'AbortError') {
+        throw new Error('Functional test execution was canceled.');
+      }
+      if (err.status) {
+        throw err;
+      }
+      lastError = err;
     }
-    throw new Error(
-      `Unable to reach TestIT backend at ${baseUrl}. Ensure the backend server is running.`
-    );
   }
 
-  let data;
-  try {
-    data = await response.json();
-  } catch {
-    throw new Error(`Server returned an unparseable response (HTTP ${response.status}).`);
-  }
-
-  if (!response.ok || !data.success) {
-    const message =
-      data?.errors && data.errors.length > 0
-        ? data.errors.join(' ')
-        : data?.message || `Test failed with status ${response.status}`;
-    const error = new Error(message);
-    error.status = response.status;
-    error.code = data?.code || 'TEST_ERROR';
-    error.errors = data?.errors;
-    throw error;
-  }
-
-  return data.data;
+  throw new Error(
+    `Unable to reach TestIT backend at ${getApiBaseUrl()}. Ensure the backend server is running.`
+  );
 }
 
 /**
  * Executes an AI-driven website test:
  * Sends the URL, natural-language instructions, and optional test credentials to the backend.
+ * Seamlessly attempts fallback ports if macOS ControlCenter / AirPlay Receiver intercepts port 5000.
  *
  * @param {object} payload
  * @param {string} payload.url - Target website URL
@@ -162,40 +194,49 @@ export async function executeFunctionalTest(definition, signal) {
  * @returns {Promise<object>} Complete AI test report
  */
 export async function executeAiTest(payload, signal) {
-  const baseUrl = getApiBaseUrl();
-  const endpoint = `${baseUrl}/api/ai-tests/run`;
+  const candidates = getCandidateBaseUrls();
+  let lastError = null;
 
-  let response;
-  try {
-    response = await fetch(endpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-      signal,
-    });
-  } catch (err) {
-    if (err.name === 'AbortError') {
-      throw new Error('AI test execution was canceled.');
+  for (const baseUrl of candidates) {
+    const endpoint = `${baseUrl}/api/ai-tests/run`;
+    try {
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal,
+      });
+
+      let data;
+      try {
+        data = await response.json();
+      } catch {
+        const parseErr = new Error(`Server returned an unparseable response (HTTP ${response.status}).`);
+        parseErr.status = response.status;
+        throw parseErr;
+      }
+
+      if (!response.ok || !data.success) {
+        const message = data?.message || `AI test failed with status ${response.status}`;
+        const error = new Error(message);
+        error.status = response.status;
+        error.code = data?.code || 'AI_TEST_ERROR';
+        throw error;
+      }
+
+      return data.data;
+    } catch (err) {
+      if (err.name === 'AbortError') {
+        throw new Error('AI test execution was canceled.');
+      }
+      if (err.status) {
+        throw err;
+      }
+      lastError = err;
     }
-    throw new Error(
-      `Unable to reach TestIT backend at ${baseUrl}. Ensure the backend server is running.`
-    );
   }
 
-  let data;
-  try {
-    data = await response.json();
-  } catch {
-    throw new Error(`Server returned an unparseable response (HTTP ${response.status}).`);
-  }
-
-  if (!response.ok || !data.success) {
-    const message = data?.message || `AI test failed with status ${response.status}`;
-    const error = new Error(message);
-    error.status = response.status;
-    error.code = data?.code || 'AI_TEST_ERROR';
-    throw error;
-  }
-
-  return data.data;
+  throw new Error(
+    `Unable to reach TestIT backend at ${getApiBaseUrl()}. Ensure the backend server is running and accessible.`
+  );
 }

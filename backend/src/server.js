@@ -3,10 +3,9 @@ dotenv.config();
 
 import app from './app.js';
 
-const PORT = process.env.PORT || 5000;
-const HOST = process.env.HOST || 'localhost';
+const PORT = parseInt(process.env.PORT, 10) || 5001;
 
-const server = app.listen(PORT, HOST, () => {
+const server = app.listen(PORT, () => {
   console.log(`TestIT backend server running on http://localhost:${PORT}`);
   console.log(`Health check endpoint: http://localhost:${PORT}/api/health`);
 });
