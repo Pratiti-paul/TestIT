@@ -19,11 +19,27 @@ import { validateUrl } from '../utils/urlValidator.js';
  * @param {string[]} [options.priorityKeywords=[]] - Keywords from user task to prioritize links
  * @returns {Promise<object>} Discovery graph and capabilities index
  */
-export async function discoverWebsite(page, startUrl, options = {}) {
-  const maxPages = options.maxPages || 5;
-  const timeoutMs = options.timeoutMs || 5000;
-  const allowLocal = options.allowLocalForTesting === true;
-  const priorityKeywords = (options.priorityKeywords || []).map((k) => k.toLowerCase());
+export async function discoverWebsite(pageOrUrl, startUrlOrOptions, maybeOptions = {}) {
+  let page = pageOrUrl;
+  let startUrl = startUrlOrOptions;
+  let options = maybeOptions;
+  let ownsBrowser = false;
+  let browser = null;
+
+  if (typeof pageOrUrl === 'string') {
+    startUrl = pageOrUrl;
+    options = typeof startUrlOrOptions === 'object' && startUrlOrOptions !== null ? startUrlOrOptions : {};
+    const { chromium } = await import('playwright');
+    browser = await chromium.launch({ headless: true });
+    page = await browser.newPage();
+    ownsBrowser = true;
+  }
+
+  try {
+    const maxPages = options.maxPages || 5;
+    const timeoutMs = options.timeoutMs || 5000;
+    const allowLocal = options.allowLocalForTesting === true || options.allowLocal === true;
+    const priorityKeywords = (options.priorityKeywords || []).map((k) => k.toLowerCase());
 
   let startOrigin = '';
   try {
@@ -89,7 +105,9 @@ export async function discoverWebsite(page, startUrl, options = {}) {
               name.includes('search') ||
               name === 'q' ||
               ariaLabel.includes('search') ||
-              i.getAttribute('role') === 'searchbox',
+              i.getAttribute('role') === 'searchbox' ||
+              (id && id.toLowerCase().includes('search')) ||
+              (i.className && typeof i.className === 'string' && i.className.toLowerCase().includes('search')),
             isPassword: type === 'password',
             isEmail: type === 'email' || name.includes('email') || placeholder.includes('email'),
           };
@@ -144,7 +162,7 @@ export async function discoverWebsite(page, startUrl, options = {}) {
 
         // 4. Products / Items cards
         const productCardCount = document.querySelectorAll(
-          '.product-card, .medicine-card, [class*="card"]:has(button), .product-item, .item-card'
+          '.product-card, .item-card, .product-item, [role="article"], [class*="card"]:has(button), [data-testid*="item" i], [data-testid*="product" i], .card'
         ).length;
 
         // 5. Cart elements
@@ -168,6 +186,19 @@ export async function discoverWebsite(page, startUrl, options = {}) {
         hasCartTable: false,
       }));
   };
+
+  // Navigate to startUrl if page is not yet there
+  if (page.url() !== startUrl) {
+    try {
+      await page.goto(startUrl, {
+        waitUntil: 'domcontentloaded',
+        timeout: timeoutMs,
+      });
+      await page.waitForTimeout(300);
+    } catch {
+      // Continue with active page
+    }
+  }
 
   // Inspect the landing page
   const initialData = await inspectCurrentPage(page.url());
@@ -207,7 +238,17 @@ export async function discoverWebsite(page, startUrl, options = {}) {
       }
 
       // Functional keywords
-      if (combinedText.includes('medicine') || combinedText.includes('product') || combinedText.includes('shop') || combinedText.includes('catalog') || combinedText.includes('store')) score += 3;
+      if (
+        combinedText.includes('product') ||
+        combinedText.includes('item') ||
+        combinedText.includes('shop') ||
+        combinedText.includes('catalog') ||
+        combinedText.includes('store') ||
+        combinedText.includes('browse') ||
+        combinedText.includes('collection') ||
+        combinedText.includes('inventory') ||
+        combinedText.includes('category')
+      ) score += 3;
       if (combinedText.includes('search')) score += 4;
       if (combinedText.includes('login') || combinedText.includes('sign in')) score += 3;
       if (combinedText.includes('cart') || combinedText.includes('basket')) score += 3;
@@ -285,15 +326,20 @@ export async function discoverWebsite(page, startUrl, options = {}) {
     // Ignore error returning to startUrl
   }
 
-  return {
-    startUrl,
-    totalPagesExplored: discoveredPages.length,
-    pages: discoveredPages,
-    searchPageUrl: discoveredPages.find((p) => p.capabilities.hasSearchField)?.url || null,
-    loginPageUrl: discoveredPages.find((p) => p.capabilities.hasLoginForm)?.url || null,
-    catalogPageUrl: discoveredPages.find((p) => p.capabilities.hasCatalogItems)?.url || null,
-    cartPageUrl: discoveredPages.find((p) => p.capabilities.hasCartView)?.url || null,
-  };
+    return {
+      startUrl,
+      totalPagesExplored: discoveredPages.length,
+      pages: discoveredPages,
+      searchPageUrl: discoveredPages.find((p) => p.capabilities.hasSearchField)?.url || null,
+      loginPageUrl: discoveredPages.find((p) => p.capabilities.hasLoginForm)?.url || null,
+      catalogPageUrl: discoveredPages.find((p) => p.capabilities.hasCatalogItems)?.url || null,
+      cartPageUrl: discoveredPages.find((p) => p.capabilities.hasCartView)?.url || null,
+    };
+  } finally {
+    if (ownsBrowser && browser) {
+      await browser.close().catch(() => {});
+    }
+  }
 }
 
 /**
@@ -318,7 +364,7 @@ export async function navigateToDiscoveredCapability(page, capability, discovery
   if (isSearchTarget) {
     const hasSearchOnCurrent = await page
       .locator(
-        'input[type="search"], input[placeholder*="search" i], [role="searchbox"], input[name="search" i], input[name="q" i], .medicine-search-input'
+        'input[type="search"], input[placeholder*="search" i], [role="searchbox"], input[name="search" i], input[name="q" i], input[class*="search" i], [data-testid*="search" i]'
       )
       .first()
       .isVisible({ timeout: 500 })
@@ -383,18 +429,23 @@ export async function navigateToDiscoveredCapability(page, capability, discovery
   let linkSelectors = [];
   if (isSearchTarget || capability === 'catalog') {
     linkSelectors = [
-      'a:has-text("Medicine")',
-      'a:has-text("Medicines")',
       'a:has-text("Products")',
       'a:has-text("Catalog")',
       'a:has-text("Shop")',
       'a:has-text("Store")',
-      'a[href*="medicine" i]',
+      'a:has-text("Items")',
+      'a:has-text("Browse")',
+      'a:has-text("Collection")',
+      'a:has-text("Search")',
       'a[href*="product" i]',
       'a[href*="catalog" i]',
       'a[href*="shop" i]',
-      'button:has-text("Medicine")',
+      'a[href*="store" i]',
+      'a[href*="item" i]',
+      'a[href*="browse" i]',
       'button:has-text("Products")',
+      'button:has-text("Shop")',
+      'button:has-text("Catalog")',
     ];
   } else if (isLoginTarget) {
     linkSelectors = [
@@ -423,6 +474,40 @@ export async function navigateToDiscoveredCapability(page, capability, discovery
         currentUrl: page.url(),
         actual: `Discovered and followed navigation link ("${selector}") from ${prevUrl} to ${page.url()}`,
       };
+    }
+  }
+
+  // Dynamic fallback: inspect visible navigation links inside nav / header
+  if (isSearchTarget || capability === 'catalog') {
+    const navLinks = await page.locator('nav a[href], header a[href], [role="navigation"] a[href]').all().catch(() => []);
+    for (const link of navLinks) {
+      const isVis = await link.isVisible().catch(() => false);
+      if (!isVis) continue;
+      const href = (await link.getAttribute('href').catch(() => '')) || '';
+      const text = (await link.innerText().catch(() => '')).trim().toLowerCase();
+
+      const isNonCatalog =
+        href === '/' ||
+        href === currentUrl ||
+        text === 'home' ||
+        text.includes('login') ||
+        text.includes('sign in') ||
+        text.includes('signup') ||
+        text.includes('cart') ||
+        text === '🛒';
+
+      if (!isNonCatalog && (text.length > 0 || href.length > 1)) {
+        const prevUrl = page.url();
+        await link.click({ timeout: Math.min(timeoutMs, 4000) });
+        await page.waitForLoadState('domcontentloaded').catch(() => {});
+        await page.waitForTimeout(500);
+
+        return {
+          found: true,
+          currentUrl: page.url(),
+          actual: `Discovered and followed navigation link ("${text || href}") from ${prevUrl} to ${page.url()}`,
+        };
+      }
     }
   }
 

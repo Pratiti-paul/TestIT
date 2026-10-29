@@ -1,7 +1,7 @@
-import { ALLOWED_ACTIONS, ALLOWED_STRATEGIES } from '../utils/functionalTestValidator.js';
-
 /**
  * Checks available LLM provider configurations in the environment.
+ * @deprecated Legacy config reader retained for test suite compatibility.
+ * Active provider selection and execution is handled exclusively by aiProvider/index.js.
  *
  * @returns {{ provider: 'gemini' | 'openai' | null, apiKey: string | null, model: string | null }}
  */
@@ -100,6 +100,88 @@ export function analyzeCredentialRequirements(instructions, credentials = {}) {
     hasValidCredentials: hasUsername && hasPassword,
     missingCredentials: missing,
   };
+}
+
+/**
+ * Extracts a specific search query term from user instructions.
+ * If no specific search query is given (or only generic terms like "products", "items"),
+ * returns null so the caller does not invent an arbitrary keyword.
+ *
+ * @param {string} text
+ * @returns {string | null}
+ */
+export function extractSearchQuery(text) {
+  if (!text || typeof text !== 'string') return null;
+
+  const genericTerms = new Set([
+    'product',
+    'products',
+    'item',
+    'items',
+    'goods',
+    'something',
+    'anything',
+    'result',
+    'results',
+    'bar',
+    'box',
+    'field',
+    'input',
+    'button',
+    'functionality',
+    'feature',
+    'catalog',
+    'page',
+    'website',
+    'site',
+    'filter',
+    'filters',
+  ]);
+
+  const isGeneric = (str) => {
+    const cleaned = str.toLowerCase().replace(/^(?:for|the|a|an|and|then)\s+/i, '').trim();
+    if (!cleaned) return true;
+    if (genericTerms.has(cleaned)) return true;
+    const words = cleaned.split(/\s+/);
+    if (words.length > 0 && genericTerms.has(words[0])) return true;
+    if (words.every((w) => genericTerms.has(w) || ['in', 'from', 'on', 'the', 'of', 'and', 'or'].includes(w))) return true;
+    return false;
+  };
+
+  // 1. Quoted string: search for "...", query "...", find "..."
+  const quotedMatch =
+    text.match(/(?:search|query|find|look)\s+(?:for\s+)?["'“]([^"'“”\n\r]+)["'”]/i) ||
+    text.match(/["'“]([^"'“”\n\r]+)["'”]/i);
+  if (quotedMatch && quotedMatch[1]) {
+    const candidate = quotedMatch[1].trim();
+    if (candidate && !isGeneric(candidate)) {
+      return candidate;
+    }
+  }
+
+  // 2. "search for <term>", "query for <term>", "look for <term>"
+  const searchForMatch = text.match(
+    /(?:search|query|look)\s+for\s+([^,;.\n]+?)(?:[,;.]|\s+(?:and|then|with|to|\.|$)|$)/i
+  );
+  if (searchForMatch && searchForMatch[1]) {
+    const candidate = searchForMatch[1].trim();
+    if (candidate && !isGeneric(candidate)) {
+      return candidate;
+    }
+  }
+
+  // 3. "search <term>", "find <term>", "query <term>" (excluding "search for", "search and", etc.)
+  const directMatch = text.match(
+    /(?:search|find|query)\s+(?!for\s+|and\s+|then\s+|with\s+|the\s+)([^,;.\n]+?)(?:[,;.]|\s+(?:and|then|with|to|\.|$)|$)/i
+  );
+  if (directMatch && directMatch[1]) {
+    const candidate = directMatch[1].trim();
+    if (candidate && !isGeneric(candidate)) {
+      return candidate;
+    }
+  }
+
+  return null;
 }
 
 /**
@@ -336,16 +418,24 @@ export function generateDeterministicPlan({ url, instructions, credentials = {} 
   }
 
   // 2. Check for Search flow
-  let searchQuery = 'Paracetamol';
+  let searchQuery = null;
+  if (testsSearch || testsCart) {
+    searchQuery = extractSearchQuery(text);
+  }
+
+  if (testsSearch && !searchQuery) {
+    return {
+      status: 'unsupported',
+      unsupportedReason:
+        'Search testing was requested, but no specific search query or keyword was specified in the testing instructions. Please specify what to search for (e.g., "search for Headphones" or "search for Laptop").',
+      objective: `Unsupported search objective: ${text}`,
+      instructions: text,
+      userInstructions: text,
+      steps: [],
+    };
+  }
 
   if (testsSearch) {
-    const searchMatch =
-      text.match(/search\s+(?:for\s+)?["']?([^"',.\n]+)["']?/i) ||
-      text.match(/query\s+(?:for\s+)?["']?([^"',.\n]+)["']?/i);
-    if (searchMatch && searchMatch[1]) {
-      searchQuery = searchMatch[1].trim();
-    }
-
     // Step to ensure we are on the search/catalog interface (discovering catalog link if not present)
     steps.push({
       id: `step-${stepCounter++}`,
@@ -353,19 +443,19 @@ export function generateDeterministicPlan({ url, instructions, credentials = {} 
       startUrl: url,
       flowId: 'search',
       requiresAuth: false,
-      target: { strategy: 'placeholder', value: 'Search for medicine...' },
+      target: { strategy: 'role', value: 'searchbox' },
       fallbacks: [
-        { strategy: 'placeholder', value: 'Search medicines...' },
         { strategy: 'placeholder', value: 'Search' },
-        { strategy: 'role', value: 'searchbox' },
-        { strategy: 'role', value: 'link', name: 'Medicine' },
-        { strategy: 'role', value: 'link', name: 'Medicines' },
+        { strategy: 'css', value: 'input[type="search"], input[name="search" i], input[name="q" i], input[placeholder*="search" i], input[class*="search" i]' },
         { strategy: 'role', value: 'link', name: 'Products' },
         { strategy: 'role', value: 'link', name: 'Shop' },
         { strategy: 'role', value: 'link', name: 'Catalog' },
-        { strategy: 'css', value: 'a[href*="medicine" i], a[href*="product" i], a[href*="catalog" i], a[href*="shop" i]' },
+        { strategy: 'role', value: 'link', name: 'Store' },
+        { strategy: 'role', value: 'link', name: 'Items' },
+        { strategy: 'role', value: 'link', name: 'Browse' },
+        { strategy: 'css', value: 'a[href*="product" i], a[href*="catalog" i], a[href*="shop" i], a[href*="store" i], a[href*="item" i]' },
       ],
-      description: 'Navigate to products/medicine listing page if search is not on current page',
+      description: 'Navigate to products or catalog listing page if search is not on current page',
       expected: 'Products or search page is active and presents a search field',
       timeoutMs: 8000,
     });
@@ -375,13 +465,11 @@ export function generateDeterministicPlan({ url, instructions, credentials = {} 
       action: 'fill',
       flowId: 'search',
       requiresAuth: false,
-      target: { strategy: 'placeholder', value: 'Search for medicine...' },
+      target: { strategy: 'role', value: 'searchbox' },
       fallbacks: [
-        { strategy: 'placeholder', value: 'Search medicines...' },
         { strategy: 'placeholder', value: 'Search' },
-        { strategy: 'role', value: 'searchbox' },
         { strategy: 'label', value: 'Search' },
-        { strategy: 'css', value: '.medicine-search-input, input[placeholder*="search" i], input[type="search"], input[name="q"], input[name="search"]' },
+        { strategy: 'css', value: 'input[type="search"], input[name="search" i], input[name="q" i], input[placeholder*="search" i], input[class*="search" i]' },
       ],
       value: searchQuery,
       isSearch: true,
@@ -397,7 +485,7 @@ export function generateDeterministicPlan({ url, instructions, credentials = {} 
       requiresAuth: false,
       target: {
         strategy: 'css',
-        value: 'button.medicine-search-btn, button[aria-label*="search" i], form button[type="submit"], button:has-text("🔍"), button:has-text("Search")',
+        value: 'button[type="submit"], button[aria-label*="search" i], button:has-text("Search"), button:has-text("🔍"), input[type="submit"]',
       },
       fallbacks: [
         { strategy: 'role', value: 'button', name: 'Search' },
@@ -416,7 +504,7 @@ export function generateDeterministicPlan({ url, instructions, credentials = {} 
       requiresAuth: false,
       target: { strategy: 'text', value: searchQuery },
       fallbacks: [
-        { strategy: 'css', value: '.medicine-card, .product-card, .search-results, .results' },
+        { strategy: 'css', value: '.product-card, .item-card, [class*="card"], [role="article"], .search-results, .results' },
         { strategy: 'text', value: 'Results' },
       ],
       description: `Verify that search results matching "${searchQuery}" are displayed`,
@@ -434,17 +522,19 @@ export function generateDeterministicPlan({ url, instructions, credentials = {} 
       requiresAuth: false,
       target: {
         strategy: 'css',
-        value: `.medicine-card:has-text("${searchQuery}") button, .product-card:has-text("${searchQuery}") button, [class*="card"]:has-text("${searchQuery}") button`,
+        value: searchQuery
+          ? `[class*="card"]:has-text("${searchQuery}") button, .product-card:has-text("${searchQuery}") button, [role="article"]:has-text("${searchQuery}") button, .item-card:has-text("${searchQuery}") button`
+          : '.product-card button, [class*="card"] button, .item-card button, .add-to-cart, button[aria-label*="cart" i]',
       },
       fallbacks: [
         { strategy: 'role', value: 'button', name: 'Add to Cart' },
         { strategy: 'text', value: 'Add to Cart' },
         { strategy: 'role', value: 'button', name: 'Add' },
         { strategy: 'text', value: 'Add' },
-        { strategy: 'css', value: '.add-to-cart, button[aria-label*="cart" i], .product-card button, .medicine-card button' },
+        { strategy: 'css', value: '.add-to-cart, button[aria-label*="cart" i], .product-card button, [class*="card"] button, .item-card button' },
       ],
-      description: `Add item ("${searchQuery}") to the shopping cart`,
-      expected: `Add product ("${searchQuery}") to the shopping cart`,
+      description: searchQuery ? `Add item ("${searchQuery}") to the shopping cart` : 'Add first item to the shopping cart',
+      expected: searchQuery ? `Add product ("${searchQuery}") to the shopping cart` : 'Add product to the shopping cart',
       timeoutMs: 5000,
     });
 
@@ -473,13 +563,19 @@ export function generateDeterministicPlan({ url, instructions, credentials = {} 
       action: 'assertVisible',
       flowId: 'cart',
       requiresAuth: false,
-      target: { strategy: 'text', value: searchQuery },
+      target: searchQuery
+        ? { strategy: 'text', value: searchQuery }
+        : { strategy: 'css', value: '.cart-page, .cart-items-container, .cart-item, table.cart' },
       fallbacks: [
         { strategy: 'css', value: '.cart-page, .cart-items-container, .cart-item, table.cart' },
         { strategy: 'text', value: 'Cart' },
       ],
-      description: `Verify that the cart contains the intended item ("${searchQuery}")`,
-      expected: `Shopping cart contains the intended item ("${searchQuery}")`,
+      description: searchQuery
+        ? `Verify that the cart contains the intended item ("${searchQuery}")`
+        : 'Verify that the cart contains the added item',
+      expected: searchQuery
+        ? `Shopping cart contains the intended item ("${searchQuery}")`
+        : 'Shopping cart contains the added item',
       timeoutMs: 5000,
     });
 
@@ -657,53 +753,7 @@ export async function planAiTest({ url, instructions, credentials = {} }) {
     };
   }
 
-  // 3. Provider selection
-  const llmConfig = getLlmConfig();
-
-  // If LLM provider is configured, call the LLM API
-  if (llmConfig.provider === 'gemini') {
-    try {
-      const plan = await callGeminiPlanner({ url, instructions, credentials, config: llmConfig });
-      return {
-        ...plan,
-        status: authCheck.requiresAuth && !authCheck.hasValidCredentials ? 'partial' : 'ready',
-        missingCredentials: authCheck.missingCredentials,
-        prohibitedActions: [],
-        planner: {
-          mode: 'llm',
-          provider: 'gemini',
-          model: llmConfig.model,
-          aiConfigured: true,
-          notice: `Test plan synthesized by Google Gemini AI (${llmConfig.model}).`,
-        },
-      };
-    } catch (err) {
-      console.warn('Gemini AI planner failed, falling back to deterministic engine:', err.message);
-      // Fall through to deterministic fallback
-    }
-  } else if (llmConfig.provider === 'openai') {
-    try {
-      const plan = await callOpenAiPlanner({ url, instructions, credentials, config: llmConfig });
-      return {
-        ...plan,
-        status: authCheck.requiresAuth && !authCheck.hasValidCredentials ? 'partial' : 'ready',
-        missingCredentials: authCheck.missingCredentials,
-        prohibitedActions: [],
-        planner: {
-          mode: 'llm',
-          provider: 'openai',
-          model: llmConfig.model,
-          aiConfigured: true,
-          notice: `Test plan synthesized by OpenAI (${llmConfig.model}).`,
-        },
-      };
-    } catch (err) {
-      console.warn('OpenAI planner failed, falling back to deterministic engine:', err.message);
-      // Fall through to deterministic fallback
-    }
-  }
-
-  // 4. Deterministic Fallback Engine (no LLM configured or LLM failed)
+  // 3. Deterministic Fallback Engine
   const fallbackPlan = generateDeterministicPlan({ url, instructions, credentials });
 
   if (fallbackPlan.status === 'unsupported') {
@@ -745,129 +795,3 @@ export async function planAiTest({ url, instructions, credentials = {} }) {
     },
   };
 }
-
-/**
- * Calls Gemini Generative Language REST API to generate a structured test plan.
- */
-async function callGeminiPlanner({ url, instructions, credentials, config }) {
-  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${config.model}:generateContent?key=${config.apiKey}`;
-
-  const systemInstruction = `You are TestIT AI, an expert QA test planning agent.
-Your job is to convert natural-language website testing instructions into an ordered list of concrete, executable Playwright browser test steps.
-
-Allowed Actions: ${ALLOWED_ACTIONS.join(', ')}.
-Allowed Target Strategies: ${ALLOWED_STRATEGIES.join(', ')}.
-Maximum steps: 25.
-Do NOT attempt destructive actions or payment submissions.
-Every navigation step must be on origin: "${new URL(url).origin}".
-
-Return ONLY valid JSON matching this schema:
-{
-  "objective": "Concise summary of the test plan",
-  "steps": [
-    {
-      "id": "step-1",
-      "action": "navigate",
-      "url": "${url}",
-      "description": "Navigate to starting website",
-      "timeoutMs": 8000
-    },
-    {
-      "id": "step-2",
-      "action": "fill",
-      "target": { "strategy": "placeholder", "value": "Search..." },
-      "value": "string value",
-      "description": "Clear description of action",
-      "timeoutMs": 5000
-    }
-  ]
-}`;
-
-  const userPrompt = `Website URL: ${url}
-User Instructions: "${instructions}"
-Credentials Provided: ${credentials?.username ? 'Yes (Username supplied)' : 'No test credentials supplied'}`;
-
-  const response = await fetch(endpoint, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      contents: [
-        { role: 'user', parts: [{ text: `${systemInstruction}\n\n${userPrompt}` }] }
-      ],
-      generationConfig: {
-        responseMimeType: 'application/json',
-        temperature: 0.2,
-      },
-    }),
-  });
-
-  if (!response.ok) {
-    throw new Error(`Gemini API returned HTTP ${response.status}`);
-  }
-
-  const data = await response.json();
-  const textContent = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-  if (!textContent) {
-    throw new Error('Gemini API returned an empty response');
-  }
-
-  const parsed = JSON.parse(textContent);
-  if (!Array.isArray(parsed.steps) || parsed.steps.length === 0) {
-    throw new Error('Gemini did not return an array of test steps');
-  }
-
-  return {
-    objective: parsed.objective || 'AI Planned Test Journey',
-    steps: parsed.steps.slice(0, 25),
-  };
-}
-
-/**
- * Calls OpenAI Chat Completions API to generate a structured test plan.
- */
-async function callOpenAiPlanner({ url, instructions, credentials, config }) {
-  const endpoint = 'https://api.openai.com/v1/chat/completions';
-
-  const systemInstruction = `You are TestIT AI, an expert QA test planning agent.
-Convert natural language website testing instructions into an ordered list of concrete, executable Playwright browser test steps.
-Allowed Actions: ${ALLOWED_ACTIONS.join(', ')}.
-Allowed Target Strategies: ${ALLOWED_STRATEGIES.join(', ')}.
-Maximum steps: 25.
-Return JSON with "objective" and "steps".`;
-
-  const response = await fetch(endpoint, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${config.apiKey}`,
-    },
-    body: JSON.stringify({
-      model: config.model,
-      response_format: { type: 'json_object' },
-      messages: [
-        { role: 'system', content: systemInstruction },
-        {
-          role: 'user',
-          content: `Website URL: ${url}\nInstructions: "${instructions}"\nCredentials: ${
-            credentials?.username ? 'Supplied' : 'None'
-          }`,
-        },
-      ],
-      temperature: 0.2,
-    }),
-  });
-
-  if (!response.ok) {
-    throw new Error(`OpenAI API returned HTTP ${response.status}`);
-  }
-
-  const data = await response.json();
-  const content = data?.choices?.[0]?.message?.content;
-  const parsed = JSON.parse(content);
-
-  return {
-    objective: parsed.objective || 'AI Planned Test Journey',
-    steps: parsed.steps.slice(0, 25),
-  };
-}
-

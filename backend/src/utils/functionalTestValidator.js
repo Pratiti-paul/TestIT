@@ -39,7 +39,7 @@ export const SAMPLE_FUNCTIONAL_TEST = {
         strategy: 'placeholder',
         value: 'Search...',
       },
-      value: 'Medicine',
+      value: 'Item',
       description: 'Fill search field with query',
       timeoutMs: 5000,
     },

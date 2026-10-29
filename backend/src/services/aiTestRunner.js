@@ -344,13 +344,14 @@ export async function ensureSearchPage(page, step, timeout, discoveryResult = nu
 
   // 1. Check if search input is already visible and enabled on current page
   const searchInputSelectors = [
-    '.medicine-search-input',
-    'input[placeholder*="search" i]',
     'input[type="search"]',
+    'input[placeholder*="search" i]',
     '[role="searchbox"]',
     'input[name="search" i]',
     'input[name="q" i]',
     '[data-testid*="search" i]',
+    'input[class*="search" i]',
+    'input[id*="search" i]',
   ];
 
   for (const sel of searchInputSelectors) {
@@ -399,14 +400,14 @@ export async function ensureSearchPage(page, step, timeout, discoveryResult = nu
         await page.waitForTimeout(500);
       } catch {
         // Fallback to in-page logo/home link
-        const logoLink = page.locator('a[href="/"], a.navbar-brand, a:has-text("Medico"), a:has-text("Home")').first();
+        const logoLink = page.locator('a[href="/"], a[aria-label*="home" i], a[aria-label*="logo" i], a.navbar-brand, a.logo, a:has-text("Home"), header a:first-of-type').first();
         if (await logoLink.isVisible({ timeout: 500 }).catch(() => false)) {
           await logoLink.click().catch(() => {});
           await page.waitForTimeout(500);
         }
       }
     } else {
-      const logoLink = page.locator('a[href="/"], a.navbar-brand, a:has-text("Medico"), a:has-text("Home")').first();
+      const logoLink = page.locator('a[href="/"], a[aria-label*="home" i], a[aria-label*="logo" i], a.navbar-brand, a.logo, a:has-text("Home"), header a:first-of-type').first();
       if (await logoLink.isVisible({ timeout: 500 }).catch(() => false)) {
         await logoLink.click().catch(() => {});
         await page.waitForTimeout(500);
@@ -437,31 +438,84 @@ export async function ensureSearchPage(page, step, timeout, discoveryResult = nu
   }
 
   // 3. Search not present on current page: discover catalog navigation links
+  // Check candidate selectors supplied in step target / fallbacks first
+  const stepCandidates = [];
+  if (step?.target?.value) {
+    if (step.target.strategy === 'css') stepCandidates.push(step.target.value);
+    else if (step.target.strategy === 'role' && step.target.name) stepCandidates.push(`a:has-text("${step.target.name}"), button:has-text("${step.target.name}")`);
+  }
+  if (Array.isArray(step?.fallbacks)) {
+    for (const fb of step.fallbacks) {
+      if (fb.strategy === 'css' && fb.value) stepCandidates.push(fb.value);
+      else if (fb.strategy === 'role' && fb.name) stepCandidates.push(`a:has-text("${fb.name}"), button:has-text("${fb.name}")`);
+    }
+  }
+
   const catalogNavSelectors = [
-    'a:has-text("Medicine")',
-    'a:has-text("Medicines")',
+    ...stepCandidates,
     'a:has-text("Products")',
     'a:has-text("Shop")',
     'a:has-text("Catalog")',
     'a:has-text("Store")',
-    'a:has-text("Pharmacy")',
-    'a[href*="medicine" i]',
+    'a:has-text("Items")',
+    'a:has-text("Browse")',
+    'a:has-text("Collection")',
+    'a:has-text("Inventory")',
+    'a:has-text("Categories")',
+    'a:has-text("Menu")',
+    'a:has-text("Search")',
     'a[href*="product" i]',
     'a[href*="catalog" i]',
     'a[href*="shop" i]',
     'a[href*="store" i]',
-    'button:has-text("Medicine")',
+    'a[href*="item" i]',
+    'a[href*="browse" i]',
+    'a[href*="collection" i]',
     'button:has-text("Products")',
     'button:has-text("Shop")',
+    'button:has-text("Catalog")',
+    'button:has-text("Browse")',
   ];
 
   let clickedNav = null;
   for (const sel of catalogNavSelectors) {
     const loc = page.locator(sel).first();
-    const isVis = await loc.isVisible({ timeout: 400 }).catch(() => false);
+    const isVis = await loc.isVisible({ timeout: 300 }).catch(() => false);
     if (isVis) {
       clickedNav = loc;
       break;
+    }
+  }
+
+  // If no predefined catalog link matched, dynamically inspect visible navigation links
+  if (!clickedNav) {
+    const navLinks = await page.locator('nav a[href], header a[href], [role="navigation"] a[href]').all().catch(() => []);
+    for (const link of navLinks) {
+      const isVis = await link.isVisible().catch(() => false);
+      if (!isVis) continue;
+      const href = (await link.getAttribute('href').catch(() => '')) || '';
+      const text = (await link.innerText().catch(() => '')).trim().toLowerCase();
+
+      const isNonCatalog =
+        href === '/' ||
+        href === currentUrl ||
+        text === 'home' ||
+        text.includes('login') ||
+        text.includes('sign in') ||
+        text.includes('signup') ||
+        text.includes('register') ||
+        text.includes('cart') ||
+        text === '🛒' ||
+        text.includes('about') ||
+        text.includes('contact') ||
+        text.includes('privacy') ||
+        text.includes('terms') ||
+        text.includes('faq');
+
+      if (!isNonCatalog && (text.length > 0 || href.length > 1)) {
+        clickedNav = link;
+        break;
+      }
     }
   }
 

@@ -238,6 +238,57 @@ describe('AI-Driven Website Testing Engine', () => {
       const actions = plan.steps.map((s) => s.action);
       assert.ok(actions.includes('assertDateSync'));
     });
+
+    it('does not fall back to Paracetamol when no search query is specified and marks objective unsupported', () => {
+      const unspecificInstructions = [
+        'Search for products and add to cart',
+        'Test the search bar and verify results',
+        'Find items and check total price',
+        'Search and filter catalog',
+      ];
+
+      for (const instructions of unspecificInstructions) {
+        const plan = generateDeterministicPlan({
+          url: 'https://example.com',
+          instructions,
+        });
+
+        assert.equal(plan.status, 'unsupported');
+        assert.equal(plan.steps.length, 0);
+        assert.match(plan.unsupportedReason, /no specific search query or keyword was specified/i);
+        // Verify it never fabricates Paracetamol
+        const stringified = JSON.stringify(plan).toLowerCase();
+        assert.ok(!stringified.includes('paracetamol'), `Invented Paracetamol for: ${instructions}`);
+      }
+    });
+
+    it('extracts specific search query and generates generic selectors without pharmacy brand assumptions', () => {
+      const plan = generateDeterministicPlan({
+        url: 'https://example.com',
+        instructions: 'Search for "Noise Cancelling Headphones", add first result to cart, and verify total price',
+      });
+
+      assert.equal(plan.status, 'ready');
+      assert.ok(plan.steps.length >= 4);
+
+      // Verify query extraction
+      const fillStep = plan.steps.find((s) => s.action === 'fill' && s.isSearch);
+      assert.ok(fillStep);
+      assert.equal(fillStep.value, 'Noise Cancelling Headphones');
+
+      // Verify no pharmacy-specific selectors or brand assumptions
+      const planStr = JSON.stringify(plan);
+      assert.ok(!planStr.includes('.medicine-card'), 'Must not contain .medicine-card');
+      assert.ok(!planStr.includes('.medicine-search-input'), 'Must not contain .medicine-search-input');
+      assert.ok(!planStr.includes('Search for medicine'), 'Must not contain Search for medicine');
+      assert.ok(!planStr.includes('Medico'), 'Must not contain Medico');
+
+      // Verify generic selectors are present
+      const ensureStep = plan.steps.find((s) => s.action === 'ensureSearchPage');
+      assert.ok(ensureStep);
+      assert.equal(ensureStep.target.strategy, 'role');
+      assert.equal(ensureStep.target.value, 'searchbox');
+    });
   });
 
   describe('4. Real Browser Execution via Playwright', () => {
