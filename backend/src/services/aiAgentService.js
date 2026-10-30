@@ -563,6 +563,7 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
           const actResult = await executeAgentAction(page, decision, stepTimeout, {
             startOrigin,
             credentials,
+            objective,
             allowLocal: options.allowLocalForTesting === true,
           });
 
@@ -883,14 +884,126 @@ async function executeAgentAction(page, decision, timeout, context) {
   switch (action) {
     case 'click': {
       const locator = await resolveAgentLocator(page, target, timeout);
-      const isEnabled = await locator.isEnabled({ timeout: Math.min(timeout, 2000) }).catch(() => true);
+      const targetStr = `${target?.strategy || ''} ${target?.value || ''} ${target?.name || ''}`.toLowerCase();
+      const preClickUrl = page.url();
+
+      let isEnabled = await locator.isEnabled({ timeout: Math.min(timeout, 2000) }).catch(() => true);
       if (!isEnabled) {
+        // If the control is currently disabled, check whether a previous submission/request is actively pending
+        const loadingInfo = await page
+          .evaluate(() => {
+            const loadingBtn = Array.from(document.querySelectorAll('button, input[type="submit"]')).find((b) => {
+              const text = (b.innerText || b.textContent || b.value || '').trim();
+              return /loading|logging\s*in|signing\s*in|submitting|please\s*wait/i.test(text);
+            });
+            const hasAriaBusy = Boolean(document.querySelector('[aria-busy="true"]'));
+            const hasSpinner = Boolean(
+              document.querySelector('.spinner, [class*="spinner" i], [class*="loading" i], button[disabled] .spinner')
+            );
+            return {
+              isLoading: Boolean(loadingBtn || hasAriaBusy || hasSpinner),
+              text: loadingBtn ? (loadingBtn.innerText || loadingBtn.textContent || '').trim() : null,
+            };
+          })
+          .catch(() => ({ isLoading: false, text: null }));
+
+        if (loadingInfo.isLoading) {
+          // Bounded wait for in-progress operation to settle rather than failing prematurely
+          const settleWaitStart = Date.now();
+          const maxWait = Math.min(timeout, 8000);
+          let settled = false;
+          while (Date.now() - settleWaitStart < maxWait) {
+            await page.waitForTimeout(300);
+            const stillBusy = await page
+              .evaluate(() => {
+                const b = Array.from(document.querySelectorAll('button, input[type="submit"]')).find((el) =>
+                  /loading|logging\s*in|signing\s*in|submitting|please\s*wait/i.test(el.innerText || el.textContent || '')
+                );
+                return Boolean(
+                  b || document.querySelector('[aria-busy="true"], .spinner, [class*="spinner" i], [class*="loading" i]')
+                );
+              })
+              .catch(() => false);
+            if (!stillBusy || page.url() !== preClickUrl) {
+              settled = true;
+              break;
+            }
+          }
+          if (settled) {
+            return { actual: `Waited for in-progress operation ("${loadingInfo.text || 'Loading...'}") to settle.` };
+          }
+        }
+
         const err = new Error(`Target button/control is disabled and cannot be clicked.`);
         err.statusType = 'BLOCKED';
         throw err;
       }
+
       await locator.click({ timeout });
       await page.waitForTimeout(400);
+
+      // Post-click settlement for form submission and login actions
+      const isSubmitOrLogin =
+        targetStr.includes('submit') ||
+        targetStr.includes('login') ||
+        targetStr.includes('sign in') ||
+        targetStr.includes('log in');
+
+      if (isSubmitOrLogin) {
+        const settleStart = Date.now();
+        const maxSettleMs = Math.max(timeout, 15000);
+        let sawLoadingState = false;
+
+        while (Date.now() - settleStart < maxSettleMs) {
+          const settleState = await page
+            .evaluate(() => {
+              const btn = Array.from(document.querySelectorAll('button, input[type="submit"]')).find((b) => {
+                const text = (b.innerText || b.textContent || b.value || '').trim();
+                return /loading|logging\s*in|signing\s*in|submitting|please\s*wait/i.test(text);
+              });
+              const hasSpinner = Boolean(
+                document.querySelector('.spinner, [class*="spinner" i], [class*="loading" i], [aria-busy="true"]')
+              );
+              const isLoading = Boolean(btn || hasSpinner);
+
+              const hasError = Boolean(
+                document.querySelector(
+                  '[role="alert"], .error, .error-message, .auth-error-message, .toast-error, .Toastify__toast--error'
+                )
+              );
+              const hasToken = Boolean(localStorage.getItem('token') || localStorage.getItem('auth_token'));
+
+              return { isLoading, hasError, hasToken };
+            })
+            .catch(() => ({ isLoading: false, hasError: false, hasToken: false }));
+
+          if (settleState.isLoading) {
+            sawLoadingState = true;
+          }
+
+          // If navigation away happened, or token stored, or error message appeared:
+          if (page.url() !== preClickUrl || settleState.hasToken || settleState.hasError) {
+            break;
+          }
+
+          // If it was loading and now stopped loading, and we are still on the same page:
+          if (sawLoadingState && !settleState.isLoading) {
+            await page.waitForTimeout(400);
+            break;
+          }
+
+          // If we haven't seen loading state yet, wait a minimum buffer (up to 1500ms) before concluding no loading occurred
+          if (!sawLoadingState && Date.now() - settleStart > 1500 && !settleState.isLoading) {
+            break;
+          }
+
+          await page.waitForTimeout(300);
+        }
+
+        await page.waitForLoadState('domcontentloaded').catch(() => {});
+        await page.waitForTimeout(300);
+      }
+
       return { actual: `Click dispatched successfully on "${target.value}"` };
     }
 
@@ -928,21 +1041,34 @@ async function executeAgentAction(page, decision, timeout, context) {
         );
 
       const rawVal = String(value !== undefined && value !== null ? value : '');
-      const thoughtStr = String(action?.thought || '').toLowerCase();
+      const thoughtStr = String(decision?.thought || action?.thought || '').toLowerCase();
       const objBehavior = String(context.objective?.targetBehavior || '').toLowerCase();
       const objDesc = String(context.objective?.description || '').toLowerCase();
 
+      // Detect placeholder tokens intended for valid credential injection
+      const isPlaceholderToken =
+        rawVal === '[VALID_USERNAME]' ||
+        rawVal === '[VALID_PASSWORD]' ||
+        rawVal === '' ||
+        rawVal === '""' ||
+        rawVal === "''";
+
       // Detect deliberate invalid credential testing
       const isDeliberateInvalidValue =
+        !isPlaceholderToken &&
         Boolean(rawVal) &&
         /invalid|wrong|incorrect|bad|fake|test_wrong|fail|dummy|nonexistent/i.test(rawVal);
 
       const isDeliberateInvalidIntent =
-        isDeliberateInvalidValue ||
-        /\b(invalid|wrong|incorrect|bad|fake)\b.*(user|email|pass|cred|login)/i.test(thoughtStr) ||
-        /\b(verify|test|assert|check)\b.*(denied|rejection|failed.*login|invalid.*login)/i.test(thoughtStr) ||
-        (/\b(invalid\s*login|invalid\s*cred|wrong\s*cred|test\s*invalid)\b/i.test(objBehavior) && !/valid\s*and\s*invalid/i.test(objBehavior)) ||
-        (/\b(invalid\s*login|invalid\s*cred|wrong\s*cred|test\s*invalid)\b/i.test(objDesc) && !/valid\s*and\s*invalid/i.test(objDesc));
+        !isPlaceholderToken &&
+        (isDeliberateInvalidValue ||
+          ((/\b(invalid|wrong|incorrect|bad|fake)\b.*(user|email|pass|cred|login)/i.test(thoughtStr) ||
+            /\b(verify|test|assert|check)\b.*(denied|rejection|failed.*login|invalid.*login)/i.test(thoughtStr)) &&
+            !/\b(valid\s*login|valid\s*credential|proceed\s*with.*valid|now.*valid|then.*valid)\b/i.test(thoughtStr)) ||
+          ((/\b(invalid\s*login|invalid\s*cred|wrong\s*cred|test\s*invalid)\b/i.test(objBehavior) ||
+            /\b(invalid\s*login|invalid\s*cred|wrong\s*cred|test\s*invalid)\b/i.test(objDesc)) &&
+            !/valid\s*and\s*invalid/i.test(objBehavior) &&
+            !/valid\s*and\s*invalid/i.test(objDesc)));
 
       let textToFill;
       let displayValue;
@@ -958,7 +1084,11 @@ async function executeAgentAction(page, decision, timeout, context) {
         }
       } else if (isUsername) {
         if (isDeliberateInvalidIntent) {
-          textToFill = rawVal || 'invalid_user@example.com';
+          if (elemType === 'email' && rawVal && !rawVal.includes('@')) {
+            textToFill = `${rawVal}@example.com`;
+          } else {
+            textToFill = rawVal || 'invalid_user@example.com';
+          }
           displayValue = `"${textToFill}"`;
         } else {
           // Exact preservation: AI model must NEVER overwrite, truncate or regenerate supplied username/email
@@ -1242,7 +1372,8 @@ export async function restoreAuthenticatedSession(page, credentials, stepIndex, 
     // Verify authentication via multi-signal verifier
     const authEvidence = await verifyAuthenticationSuccess(page, {
       submittedUsername: credentials.username,
-      timeout: 4000,
+      preLoginUrl: page.url(),
+      timeout: 8000,
     });
 
     if (authEvidence.pass) {
