@@ -60,11 +60,16 @@ export const runAiTestEndpoint = async (req, res) => {
     // 4. If a live AI Provider is configured, execute the autonomous agent loop
     const activeProvider = getActiveAiProvider();
     if (activeProvider) {
-      const agentReport = await executeAiAgent({
-        url: trimmedUrl,
-        instructions: instructions.trim(),
-        credentials: credentials || {},
-      });
+      const agentReport = await executeAiAgent(
+        {
+          url: trimmedUrl,
+          instructions: instructions.trim(),
+          credentials: credentials || {},
+        },
+        {
+          maxSteps: req.body.maxSteps ? Number(req.body.maxSteps) : 25,
+        }
+      );
       return res.status(200).json({
         success: true,
         data: agentReport,

@@ -136,7 +136,7 @@ Requirements:
     history = [],
     credentials = {},
     stepNumber = 1,
-    maxSteps = 15,
+    maxSteps = 25,
   }) {
     const endpoint = 'https://api.openai.com/v1/chat/completions';
 

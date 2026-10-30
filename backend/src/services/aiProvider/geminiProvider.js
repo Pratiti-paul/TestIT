@@ -95,18 +95,26 @@ Test Credentials Available: ${credentials?.username ? 'Yes (Username/Password pr
         }),
       };
 
-      try {
-        response = await fetch(endpoint, {
-          ...planPayload,
-          signal: AbortSignal.timeout(this.timeoutMs),
-        });
-      } catch (firstErr) {
-        // Retry once on transient network hiccup or timeout
-        await new Promise((r) => setTimeout(r, 1200));
-        response = await fetch(endpoint, {
-          ...planPayload,
-          signal: AbortSignal.timeout(this.timeoutMs),
-        });
+      const maxRetries = 3;
+      for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+          response = await fetch(endpoint, {
+            ...planPayload,
+            signal: AbortSignal.timeout(this.timeoutMs),
+          });
+        } catch (firstErr) {
+          if (attempt === maxRetries) throw firstErr;
+          await new Promise((r) => setTimeout(r, 1200 * attempt));
+          continue;
+        }
+
+        if ((response.status === 429 || response.status === 503) && attempt < maxRetries) {
+          const retryAfterSec = parseInt(response.headers?.get?.('retry-after') || '0', 10);
+          const waitMs = retryAfterSec > 0 ? retryAfterSec * 1000 : 2000 * attempt;
+          await new Promise((r) => setTimeout(r, waitMs));
+          continue;
+        }
+        break;
       }
 
       if (!response.ok) {
@@ -189,7 +197,7 @@ Test Credentials Available: ${credentials?.username ? 'Yes (Username/Password pr
    * @param {Array<object>} params.history - History of actions taken and verified results so far
    * @param {object} [params.credentials] - Optional test credentials
    * @param {number} params.stepNumber - Current step index (1-based)
-   * @param {number} params.maxSteps - Maximum allowable steps
+   * @param {number} [params.maxSteps=25] - Maximum allowable steps
    * @returns {Promise<object>} Next action decision or conclusion
    */
   async decideNextStep({
@@ -198,7 +206,7 @@ Test Credentials Available: ${credentials?.username ? 'Yes (Username/Password pr
     history = [],
     credentials = {},
     stepNumber = 1,
-    maxSteps = 15,
+    maxSteps = 25,
   }) {
     // Authenticate via standard x-goog-api-key request header to avoid embedding secret in URL
     const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${this.model}:generateContent`;
@@ -312,18 +320,26 @@ Return ONLY valid JSON matching this schema:
         }),
       };
 
-      try {
-        response = await fetch(endpoint, {
-          ...fetchPayload,
-          signal: AbortSignal.timeout(this.timeoutMs),
-        });
-      } catch (firstErr) {
-        // Retry once on transient network hiccup or timeout
-        await new Promise((r) => setTimeout(r, 1200));
-        response = await fetch(endpoint, {
-          ...fetchPayload,
-          signal: AbortSignal.timeout(this.timeoutMs),
-        });
+      const maxRetries = 3;
+      for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+          response = await fetch(endpoint, {
+            ...fetchPayload,
+            signal: AbortSignal.timeout(this.timeoutMs),
+          });
+        } catch (firstErr) {
+          if (attempt === maxRetries) throw firstErr;
+          await new Promise((r) => setTimeout(r, 1200 * attempt));
+          continue;
+        }
+
+        if ((response.status === 429 || response.status === 503) && attempt < maxRetries) {
+          const retryAfterSec = parseInt(response.headers?.get?.('retry-after') || '0', 10);
+          const waitMs = retryAfterSec > 0 ? retryAfterSec * 1000 : 2500 * attempt;
+          await new Promise((r) => setTimeout(r, waitMs));
+          continue;
+        }
+        break;
       }
 
       if (!response.ok) {
