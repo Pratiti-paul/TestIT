@@ -11,6 +11,7 @@ import {
 import { verifyDateAndWeekdaySync, extractDateTokens } from '../src/services/verifiers/dateVerifier.js';
 import { verifyCalculation, verifySorting } from '../src/services/verifiers/calculationVerifier.js';
 import { validateAgentDecision, getMissingProviderReport } from '../src/services/aiProvider/index.js';
+import { verifyAuthenticationSuccess } from '../src/services/verifiers/authVerifier.js';
 
 describe('Autonomous AI QA Agent Suite', () => {
   let server;
@@ -250,6 +251,52 @@ describe('Autonomous AI QA Agent Suite', () => {
       } else if (url.pathname === '/store-with-protected-orders') {
         res.writeHead(302, { Location: '/login-test-portal?redirect=/orders' });
         res.end();
+      } else if (url.pathname === '/session-expiration-portal') {
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end(`
+          <!DOCTYPE html>
+          <html>
+            <head><title>Account Portal</title></head>
+            <body>
+              <h1>Member Portal</h1>
+              <a href="/trigger-session-expired" id="view-statement-btn">View Monthly Statement</a>
+            </body>
+          </html>
+        `);
+      } else if (url.pathname === '/trigger-session-expired') {
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end(`
+          <!DOCTYPE html>
+          <html>
+            <head><title>Session Expired</title></head>
+            <body>
+              <div id="session-expired-banner">
+                <h2>Session Expired: Please log in again</h2>
+                <form id="expired-login-form" onsubmit="handleExpiredAuth(event)">
+                  <input id="exp-user" name="user" placeholder="Username" required />
+                  <input id="exp-pass" name="pass" type="password" placeholder="Password" required />
+                  <button type="submit" id="exp-submit">Sign In</button>
+                </form>
+              </div>
+              <div id="statement-view" style="display:none;">
+                <h3>Monthly Statement: October 2026</h3>
+                <p>Status: All accounts settled</p>
+              </div>
+              <script>
+                function handleExpiredAuth(e) {
+                  e.preventDefault();
+                  const u = document.getElementById('exp-user').value.trim();
+                  const p = document.getElementById('exp-pass').value;
+                  if ((u === 'validuser' || u === 'abc@gmail.com') && (p === 'validpass123' || p === 'SuperSecret123!@#')) {
+                    document.getElementById('session-expired-banner').style.display = 'none';
+                    document.getElementById('statement-view').style.display = 'block';
+                    localStorage.setItem('auth_token', 'restored_token_123');
+                  }
+                }
+              </script>
+            </body>
+          </html>
+        `);
       } else {
         res.writeHead(404);
         res.end('Not Found');
@@ -1952,6 +1999,355 @@ describe('Autonomous AI QA Agent Suite', () => {
       const restoreStep = report.steps.find((s) => s.action === 'restoreSession');
       assert.ok(restoreStep, 'restoreSession step must have executed upon discovering barrier');
       assert.equal(restoreStep.status, 'PASS');
+    });
+  });
+
+  describe('7. Authenticated Workflow Execution, Session Restoration & Expiration Handling', () => {
+    it('1. restores valid session when an invalid-login test leaves browser unauthenticated and subsequent objective requires auth', async () => {
+      const mockObjectives = [
+        {
+          id: 'obj-invalid-check',
+          description: 'Verify login rejection with deliberately invalid credentials',
+          targetBehavior: 'Invalid login verification',
+        },
+        {
+          id: 'obj-private-orders',
+          description: 'Inspect private member order history',
+          targetBehavior: 'View authenticated order history',
+          requiresAuth: true,
+        },
+      ];
+
+      let obj1Calls = 0;
+      let obj2Calls = 0;
+
+      const mockSteps = ({ objective }) => {
+        if (objective.id === 'obj-invalid-check') {
+          obj1Calls++;
+          if (obj1Calls === 1) {
+            return {
+              thought: 'Submit bad username',
+              action: 'fill',
+              target: { strategy: 'placeholder', value: 'Username' },
+              value: 'deliberately_invalid_user',
+            };
+          }
+          if (obj1Calls === 2) {
+            return {
+              thought: 'Submit bad password',
+              action: 'fill',
+              target: { strategy: 'placeholder', value: 'Password' },
+              value: 'wrong_password',
+            };
+          }
+          if (obj1Calls === 3) {
+            return {
+              thought: 'Submit form',
+              action: 'click',
+              target: { strategy: 'role', value: 'button', name: 'Sign In' },
+            };
+          }
+          if (obj1Calls === 4) {
+            return {
+              thought: 'Assert error message is visible',
+              action: 'assertVisible',
+              target: { strategy: 'text', value: 'Invalid username or password' },
+            };
+          }
+          return {
+            thought: 'Conclude invalid login verification',
+            action: 'conclude',
+            conclude: { outcome: 'PASS', reasoning: 'Rejection verified.' },
+          };
+        }
+
+        if (objective.id === 'obj-private-orders') {
+          obj2Calls++;
+          if (obj2Calls === 1) {
+            return {
+              thought: 'Verify orders link is visible in restored session',
+              action: 'assertVisible',
+              target: { strategy: 'text', value: 'My Order History' },
+            };
+          }
+          return {
+            thought: 'Conclude order inspection',
+            action: 'conclude',
+            conclude: { outcome: 'PASS', reasoning: 'Order history verified in restored authenticated session.' },
+          };
+        }
+      };
+
+      const report = await executeAiAgent(
+        {
+          url: `${baseUrl}/login-test-portal`,
+          instructions: 'Test invalid login rejection, then inspect member order history with valid credentials',
+          credentials: { username: 'validuser', password: 'validpass123' },
+        },
+        {
+          allowLocalForTesting: true,
+          allowMock: true,
+          mockObjectives,
+          mockSteps,
+        }
+      );
+
+      assert.equal(report.status, 'passed');
+      assert.equal(report.failedSteps, 0);
+      assert.equal(report.skippedSteps, 0);
+      assert.ok(report.passedSteps >= 2);
+
+      // Verify restoreSession step was executed prior to running objective 2
+      const restoreStep = report.steps.find((s) => s.action === 'restoreSession');
+      assert.ok(restoreStep, 'restoreSession step must have been executed for objective 2');
+      assert.equal(restoreStep.status, 'PASS');
+      assert.match(restoreStep.actual, /Successfully restored authenticated session/i);
+
+      // Both objectives must be satisfied
+      assert.match(report.coverageAndLimitations.tested, /Verify login rejection/i);
+      assert.match(report.coverageAndLimitations.tested, /Inspect private member order history/i);
+    });
+
+    it('2. detects expired session and safely restores session when valid credentials are available', async () => {
+      const mockObjectives = [
+        {
+          id: 'obj-statement',
+          description: 'Access member monthly statement',
+          targetBehavior: 'Member statement inspection',
+        },
+      ];
+
+      const mockSteps = [
+        // Step 1: Click view statement link which triggers session expiration
+        {
+          thought: 'Click view monthly statement',
+          action: 'click',
+          target: { strategy: 'text', value: 'View Monthly Statement' },
+        },
+        // Upon click, page shows session expiration banner.
+        // Agent detects expired session barrier, calls restoreAuthenticatedSession with supplied credentials,
+        // and session is restored!
+        {
+          thought: 'Assert statement content is visible after session restoration',
+          action: 'assertVisible',
+          target: { strategy: 'text', value: 'Monthly Statement: October 2026' },
+        },
+        {
+          thought: 'Conclude statement verification',
+          action: 'conclude',
+          conclude: { outcome: 'PASS', reasoning: 'Statement verified after restoring expired session.' },
+        },
+      ];
+
+      const report = await executeAiAgent(
+        {
+          url: `${baseUrl}/session-expiration-portal`,
+          instructions: 'Access member monthly statement',
+          credentials: { username: 'validuser', password: 'validpass123' },
+        },
+        {
+          allowLocalForTesting: true,
+          allowMock: true,
+          mockObjectives,
+          mockSteps,
+        }
+      );
+
+      assert.equal(report.status, 'passed');
+      assert.equal(report.failedSteps, 0);
+      assert.equal(report.blockedSteps, 0);
+      assert.ok(report.passedSteps >= 2);
+
+      const restoreStep = report.steps.find((s) => s.action === 'restoreSession');
+      assert.ok(restoreStep, 'restoreSession step must have restored expired session');
+      assert.equal(restoreStep.status, 'PASS');
+    });
+
+    it('3. detects expired session and halts safely as BLOCKED when valid credentials are unavailable', async () => {
+      const mockObjectives = [
+        {
+          id: 'obj-statement',
+          description: 'Access member monthly statement',
+          targetBehavior: 'Member statement inspection',
+        },
+      ];
+
+      const mockSteps = [
+        {
+          thought: 'Click view monthly statement',
+          action: 'click',
+          target: { strategy: 'text', value: 'View Monthly Statement' },
+        },
+      ];
+
+      const report = await executeAiAgent(
+        {
+          url: `${baseUrl}/session-expiration-portal`,
+          instructions: 'Access member monthly statement',
+          credentials: {}, // Zero credentials provided
+        },
+        {
+          allowLocalForTesting: true,
+          allowMock: true,
+          mockObjectives,
+          mockSteps,
+        }
+      );
+
+      assert.equal(report.status, 'blocked');
+      assert.equal(report.blockedSteps, 1);
+      assert.equal(report.failedSteps, 0);
+
+      const blockedStep = report.steps.find((s) => s.status === 'BLOCKED');
+      assert.ok(blockedStep, 'Objective must be marked BLOCKED when session expires without credentials');
+      assert.match(blockedStep.actual, /Active session expired|Authentication prerequisite required/i);
+    });
+
+    it('4. marks dependent objectives as SKIPPED when authentication fails and avoids repeated login attempts', async () => {
+      const mockObjectives = [
+        {
+          id: 'obj-1-valid-login',
+          description: 'Log in with valid credentials and verify user profile',
+          targetBehavior: 'Authenticate with valid credentials',
+        },
+        {
+          id: 'obj-2-private-profile',
+          description: 'Inspect private user account profile',
+          targetBehavior: 'Private profile inspection',
+          requiresAuth: true,
+          dependsOn: ['obj-1-valid-login'],
+        },
+        {
+          id: 'obj-3-calendar',
+          description: 'Check whether the displayed weekday matches the calendar date',
+          targetBehavior: 'Calendar synchronization',
+        },
+      ];
+
+      let loginAttempts = 0;
+      let obj3Calls = 0;
+
+      const mockSteps = ({ objective }) => {
+        if (objective.id === 'obj-1-valid-login') {
+          loginAttempts++;
+          if (loginAttempts === 1) {
+            return {
+              thought: 'Navigate to login portal',
+              action: 'navigate',
+              value: `${baseUrl}/login-test-portal`,
+            };
+          }
+          if (loginAttempts === 2) {
+            return {
+              thought: 'Enter username',
+              action: 'fill',
+              target: { strategy: 'placeholder', value: 'Username' },
+              value: 'rejected_user',
+            };
+          }
+          if (loginAttempts === 3) {
+            return {
+              thought: 'Enter password',
+              action: 'fill',
+              target: { strategy: 'placeholder', value: 'Password' },
+              value: 'wrong_password_123',
+            };
+          }
+          if (loginAttempts === 4) {
+            return {
+              thought: 'Submit form',
+              action: 'click',
+              target: { strategy: 'role', value: 'button', name: 'Sign In' },
+            };
+          }
+          return {
+            thought: 'Conclude login attempt',
+            action: 'conclude',
+            conclude: { outcome: 'PASS', reasoning: 'Form submitted.' },
+          };
+        }
+
+        if (objective.id === 'obj-3-calendar') {
+          obj3Calls++;
+          if (obj3Calls === 1) {
+            return {
+              thought: 'Verify calendar date sync independently',
+              action: 'assertDateSync',
+            };
+          }
+          return {
+            thought: 'Conclude calendar check',
+            action: 'conclude',
+            conclude: { outcome: 'PASS', reasoning: 'Calendar verified.' },
+          };
+        }
+      };
+
+      const report = await executeAiAgent(
+        {
+          url: `${baseUrl}/calendar-sync`,
+          instructions: 'Login, inspect profile, and check calendar',
+          credentials: { username: 'rejected_user', password: 'wrong_password_123' },
+        },
+        {
+          allowLocalForTesting: true,
+          allowMock: true,
+          mockObjectives,
+          mockSteps,
+        }
+      );
+
+      // Objective 1 failed because verification rejected the invalid credentials
+      assert.equal(report.status, 'failed');
+      const obj1Steps = report.steps.filter((s) => s.objectiveId === 'obj-1-valid-login');
+      assert.ok(obj1Steps.length > 0);
+
+      // Objective 2 was dependent on obj-1, so it must be SKIPPED
+      const obj2Steps = report.steps.filter((s) => s.objectiveId === 'obj-2-private-profile');
+      assert.ok(obj2Steps.length > 0);
+      assert.equal(obj2Steps[0].status, 'SKIPPED');
+      assert.match(obj2Steps[0].actual, /earlier authentication verification failed|prerequisite objective/i);
+
+      // Objective 3 was independent, so it executed and passed!
+      const obj3Steps = report.steps.filter((s) => s.objectiveId === 'obj-3-calendar');
+      assert.ok(obj3Steps.length > 0);
+      assert.ok(obj3Steps.some((s) => s.status === 'PASS'));
+
+      // Ensure no repeated login attempt was made for objective 2
+      const restoreSteps = report.steps.filter((s) => s.action === 'restoreSession');
+      assert.equal(restoreSteps.length, 0, 'No repeated session restoration attempt when authFailed is true');
+    });
+
+    it('5. never assumes form submission alone is authentication success without verifiable browser evidence', async () => {
+      // Test verifyAuthenticationSuccess directly on an unauthenticated page where submit button was clicked
+      // but no redirect, no token, and no profile indicators exist
+      const mockPage = {
+        url: () => 'http://example.com/login',
+        waitForTimeout: async () => {},
+        waitForLoadState: async () => {},
+        context: () => ({
+          cookies: async () => [],
+        }),
+        evaluate: async () => ({
+          observedError: null,
+          validationMessage: null,
+          isLoading: false,
+          hasVisiblePasswordInput: true, // Login form remains displayed!
+          hasAuthTokenInStorage: false,
+          tokenKey: null,
+          discoveredIndicators: [],
+          cookiePresent: false,
+        }),
+      };
+
+      const authEvidence = await verifyAuthenticationSuccess(mockPage, {
+        submittedUsername: 'testuser@example.com',
+        preLoginUrl: 'http://example.com/login',
+      });
+
+      assert.equal(authEvidence.pass, false, 'Form submission without state change must NOT pass verification');
+      assert.equal(authEvidence.status, 'FAIL');
+      assert.match(authEvidence.actual, /Login form remains displayed/i);
     });
   });
 });

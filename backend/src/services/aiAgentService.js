@@ -262,6 +262,7 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
         !sessionIsAuthenticated &&
         credentials?.username &&
         credentials?.password &&
+        !authFailed &&
         page &&
         !page.isClosed()
       ) {
@@ -279,18 +280,10 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
           authSucceeded = true;
           authFailed = false;
         } else {
-          executionSteps.push({
-            stepIndex: currentStepIndex++,
-            objectiveId: objId,
-            action: 'skip',
-            description: `Skip objective: ${objective.description}`,
-            status: 'SKIPPED',
-            durationMs: 0,
-            expected: 'Active authenticated session restored',
-            actual: 'Skipped: Failed to restore valid authenticated session using supplied credentials.',
-            screenshot: null,
-          });
-          objectiveOutcomes.set(objId, 'SKIPPED');
+          sessionIsAuthenticated = false;
+          authSucceeded = false;
+          authFailed = true;
+          objectiveOutcomes.set(objId, 'FAIL');
           failedObjectiveIds.add(objId);
           continue;
         }
@@ -369,11 +362,14 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
           break;
         }
 
-        // Dynamic authentication barrier discovery on non-login objectives
-        if (!isLoginVerificationObjective(objective) && !sessionIsAuthenticated) {
+        // Dynamic authentication barrier discovery & expired session detection on non-login objectives
+        if (!isLoginVerificationObjective(objective)) {
           const barrier = await detectAuthenticationBarrier(page, observation, startOrigin);
           if (barrier.isBarrier) {
-            if (credentials?.username && credentials?.password) {
+            const wasSessionAuthenticated = sessionIsAuthenticated;
+            sessionIsAuthenticated = false;
+
+            if (credentials?.username && credentials?.password && !authFailed) {
               const restored = await restoreAuthenticatedSession(
                 page,
                 credentials,
@@ -393,7 +389,12 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
                   // ignore observation refresh error
                 }
               } else {
-                const barrierReason = `Blocked: Authentication prerequisite required (automatic session restoration failed with supplied credentials).`;
+                authFailed = true;
+                sessionIsAuthenticated = false;
+                authSucceeded = false;
+                const barrierReason = wasSessionAuthenticated
+                  ? 'Blocked: Active session expired and automated session restoration failed with supplied credentials.'
+                  : 'Blocked: Authentication prerequisite required (automatic session restoration failed with supplied credentials).';
                 objectiveOutcome = 'BLOCKED';
                 objectiveFailure = { description: barrierReason };
                 if (!blockedReason) blockedReason = barrierReason;
@@ -401,15 +402,21 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
                 break;
               }
             } else {
-              const barrierReason = `Blocked: Authentication prerequisite required (${barrier.reason}), but no test account credentials were provided.`;
+              const barrierReason = wasSessionAuthenticated
+                ? `Blocked: Active session expired (${barrier.reason}), but no test account credentials were provided to restore it.`
+                : authFailed
+                ? 'Blocked: Authentication prerequisite required, but earlier authentication verification failed.'
+                : `Blocked: Authentication prerequisite required (${barrier.reason}), but no test account credentials were provided.`;
               executionSteps.push({
                 stepIndex: currentStepIndex++,
                 objectiveId: objId,
                 action: 'blocked',
-                description: `Authentication barrier detected: ${objective.description}`,
+                description: wasSessionAuthenticated
+                  ? `Session expired during objective: ${objective.description}`
+                  : `Authentication barrier detected: ${objective.description}`,
                 status: 'BLOCKED',
                 durationMs: 0,
-                expected: objective.expectedOutcome || 'Feature is publicly accessible',
+                expected: wasSessionAuthenticated ? 'Active session maintained' : (objective.expectedOutcome || 'Feature is publicly accessible'),
                 actual: barrierReason,
                 screenshot: await captureSafeScreenshot(page),
               });
@@ -484,13 +491,15 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
           if (concludeStatus === 'FAIL') {
             if (
               !isLoginVerificationObjective(objective) &&
-              !sessionIsAuthenticated &&
-              (!credentials?.username || !credentials?.password)
+              (!credentials?.username || !credentials?.password || authFailed)
             ) {
               const barrier = await detectAuthenticationBarrier(page, observation, startOrigin);
               if (barrier.isBarrier) {
                 concludeStatus = 'BLOCKED';
-                const barrierReason = `Blocked: Authentication prerequisite required (${barrier.reason}), but no test account credentials were provided.`;
+                const barrierReason = sessionIsAuthenticated
+                  ? `Blocked: Active session expired (${barrier.reason}), but no valid test credentials were provided to restore it.`
+                  : `Blocked: Authentication prerequisite required (${barrier.reason}), but no test account credentials were provided.`;
+                sessionIsAuthenticated = false;
                 conclusion.reasoning = barrierReason;
               }
             }
@@ -590,12 +599,15 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
           stepActual = actErr.message;
           stepScreenshot = await captureSafeScreenshot(page);
 
-          // If the action failed because of an unauthenticated barrier and credentials were not provided, mark as BLOCKED
-          if (!isLoginVerificationObjective(objective) && !sessionIsAuthenticated) {
+          // If the action failed because of an unauthenticated barrier or expired session and credentials were not provided, mark as BLOCKED
+          if (!isLoginVerificationObjective(objective)) {
             const barrier = await detectAuthenticationBarrier(page, null, startOrigin);
-            if (barrier.isBarrier && (!credentials?.username || !credentials?.password)) {
+            if (barrier.isBarrier && (!credentials?.username || !credentials?.password || authFailed)) {
               stepStatus = 'BLOCKED';
-              stepActual = `Blocked: Authentication prerequisite required (${barrier.reason}), but no test account credentials were provided.`;
+              stepActual = sessionIsAuthenticated
+                ? `Blocked: Active session expired (${barrier.reason}), but no valid test credentials were provided to restore it.`
+                : `Blocked: Authentication prerequisite required (${barrier.reason}), but no test account credentials were provided.`;
+              sessionIsAuthenticated = false;
             }
           }
 
@@ -1179,6 +1191,7 @@ export function requiresAuthenticatedSession(objective) {
  */
 export async function restoreAuthenticatedSession(page, credentials, stepIndex, objId, executionSteps, timeout) {
   if (!page || page.isClosed()) return false;
+  if (!credentials?.username || !credentials?.password) return false;
   const startMs = Date.now();
 
   try {
@@ -1192,7 +1205,7 @@ export async function restoreAuthenticatedSession(page, credentials, stepIndex, 
 
     // If not, see if there is a login link or button to navigate to the login form
     if (!hasLoginForm) {
-      const loginLink = page.locator('a[href*="login" i], a[href*="signin" i], a:has-text("Sign in"), a:has-text("Log in"), button:has-text("Sign in"), button:has-text("Log in")').first();
+      const loginLink = page.locator('a[href*="login" i], a[href*="signin" i], a:has-text("Sign in"), a:has-text("Log in"), a:has-text("Login"), button:has-text("Sign in"), button:has-text("Log in"), button:has-text("Login")').first();
       const linkVisible = await loginLink.isVisible().catch(() => false);
       if (linkVisible) {
         await loginLink.click({ timeout: 3000 }).catch(() => {});
@@ -1203,25 +1216,28 @@ export async function restoreAuthenticatedSession(page, credentials, stepIndex, 
 
     // Locate username and password inputs
     const passInput = page.locator('input[type="password"]').first();
-    const isPassVisible = await passInput.isVisible({ timeout: 2000 }).catch(() => false);
+    const isPassVisible = await passInput.isVisible({ timeout: 2500 }).catch(() => false);
     if (!isPassVisible) return false;
 
-    const userInput = page.locator('input[type="email"], input[type="text"][name*="user" i], input[type="text"][name*="email" i], input[name*="user" i], input[name*="email" i], input[id*="user" i], input[id*="email" i], input:not([type="password"]):not([type="hidden"])').first();
-    const isUserVisible = await userInput.isVisible({ timeout: 2000 }).catch(() => false);
+    const userInput = page.locator('input[type="email"], input[type="text"][name*="user" i], input[type="text"][name*="email" i], input[name*="user" i], input[name*="email" i], input[id*="user" i], input[id*="email" i], input[placeholder*="user" i], input[placeholder*="email" i], input:not([type="password"]):not([type="hidden"]):not([type="submit"]):not([type="button"])').first();
+    const isUserVisible = await userInput.isVisible({ timeout: 2500 }).catch(() => false);
     if (!isUserVisible) return false;
 
-    // Fill valid credentials
+    // Fill valid credentials (preserving exact supplied values)
     await userInput.fill(credentials.username, { timeout: 3000 });
     await passInput.fill(credentials.password, { timeout: 3000 });
 
     // Submit form
-    const submitBtn = page.locator('button[type="submit"], input[type="submit"], button:has-text("Sign in"), button:has-text("Log in"), button:has-text("Login")').first();
+    const submitBtn = page.locator('button[type="submit"], input[type="submit"], button:has-text("Sign in"), button:has-text("Log in"), button:has-text("Login"), button:has-text("Sign In"), button:has-text("Log In")').first();
     const hasBtn = await submitBtn.isVisible().catch(() => false);
     if (hasBtn) {
       await submitBtn.click({ timeout: 3000 });
     } else {
       await passInput.press('Enter', { timeout: 3000 });
     }
+
+    await page.waitForTimeout(400);
+    await page.waitForLoadState('domcontentloaded').catch(() => {});
 
     // Verify authentication via multi-signal verifier
     const authEvidence = await verifyAuthenticationSuccess(page, {
@@ -1244,8 +1260,30 @@ export async function restoreAuthenticatedSession(page, credentials, stepIndex, 
       return true;
     }
 
+    executionSteps.push({
+      stepIndex,
+      objectiveId: objId,
+      action: 'restoreSession',
+      description: 'Attempt to restore authenticated session using supplied test credentials',
+      status: 'FAIL',
+      durationMs: Date.now() - startMs,
+      expected: 'Active authenticated session established in browser',
+      actual: `Session restoration failed: ${authEvidence.actual}`,
+      screenshot: await captureSafeScreenshot(page),
+    });
     return false;
-  } catch {
+  } catch (err) {
+    executionSteps.push({
+      stepIndex,
+      objectiveId: objId,
+      action: 'restoreSession',
+      description: 'Attempt to restore authenticated session using supplied test credentials',
+      status: 'FAIL',
+      durationMs: Date.now() - startMs,
+      expected: 'Active authenticated session established in browser',
+      actual: `Session restoration error: ${err.message}`,
+      screenshot: await captureSafeScreenshot(page),
+    });
     return false;
   }
 }

@@ -229,6 +229,26 @@ export async function verifyAuthenticationSuccess(page, options = {}) {
     };
   }
 
+  // Context cookie inspection for HTTP-only session tokens
+  let hasSessionCookie = false;
+  let sessionCookieName = null;
+  try {
+    if (page.context && typeof page.context().cookies === 'function') {
+      const cookies = await page.context().cookies();
+      const sessionCookiePatterns = /session|auth|token|jwt|sid|logged_in/i;
+      const matched = cookies.find((c) => sessionCookiePatterns.test(c.name));
+      if (matched) {
+        hasSessionCookie = true;
+        sessionCookieName = matched.name;
+      }
+    }
+  } catch {
+    // Ignore cookie retrieval errors
+  }
+
+  signals.hasSessionCookie = hasSessionCookie;
+  signals.sessionCookieName = sessionCookieName;
+
   // C. Successful Authentication via multiple positive signals
   const positiveSignals = [];
   if (urlChanged) {
@@ -239,6 +259,9 @@ export async function verifyAuthenticationSuccess(page, options = {}) {
   }
   if (signals.hasAuthTokenInStorage) {
     positiveSignals.push(`auth token stored in ${signals.tokenKey}`);
+  }
+  if (hasSessionCookie) {
+    positiveSignals.push(`session cookie present (${sessionCookieName})`);
   }
   if (signals.discoveredIndicators.length > 0) {
     positiveSignals.push(`discovered ${signals.discoveredIndicators.join(', ')}`);
