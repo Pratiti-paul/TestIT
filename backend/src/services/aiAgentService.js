@@ -777,6 +777,7 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
           if (actResult.isDeadClick) {
             deadClicksInObjective++;
             lastActionWasDeadClick = true;
+            stepStatus = 'UNVERIFIED';
           } else {
             lastActionWasDeadClick = false;
           }
@@ -1398,8 +1399,99 @@ async function executeAgentAction(page, decision, timeout, context) {
       } else if (isNotificationShown) {
         clickActual = `Clicked "${target.value || target.name || 'control'}". Observed update: "${postClickSnapshot.notification}"`;
       } else if (!isDomChanged) {
-        isDeadClick = true;
-        clickActual = `Click dispatched on "${target.value || target.name || 'control'}" but produced no observable functional change (no-op/dead click).`;
+        // Delayed state update check (up to 500ms)
+        await page.waitForTimeout(500);
+        const delayedSnapshot = await page
+          .evaluate(() => {
+            const el = document.querySelector(
+              '[role="status"], [role="alert"], .alert, .modal, .toast, .confirmation, [aria-live="polite"], .cart-count, [data-testid="cart-badge"]'
+            );
+            const notification =
+              el && el.offsetWidth > 0 && el.offsetHeight > 0
+                ? (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 100)
+                : null;
+            return {
+              textLength: (document.body?.innerText || '').length,
+              domCount: document.querySelectorAll('*').length,
+              tableRows: document.querySelectorAll('tr, li, [role="row"]').length,
+              notification,
+            };
+          })
+          .catch(() => null);
+
+        const isDelayedChanged =
+          delayedSnapshot &&
+          (Boolean(delayedSnapshot.notification) ||
+            Math.abs(delayedSnapshot.textLength - preClickSnapshot.textLength) > 0 ||
+            delayedSnapshot.domCount !== preClickSnapshot.domCount ||
+            delayedSnapshot.tableRows !== preClickSnapshot.tableRows);
+
+        if (isDelayedChanged) {
+          clickActual = delayedSnapshot.notification
+            ? `Clicked "${target.value || target.name || 'control'}". Observed update: "${delayedSnapshot.notification}"`
+            : `Clicked "${target.value || target.name || 'control'}" and verified state update.`;
+        } else {
+          // Action Recovery: re-evaluate the target control within its component and attempt alternative dispatch
+          isDeadClick = true;
+          try {
+            const recoveryHandle = await locator
+              .evaluateHandle((el) => {
+                // If el is an icon/span/svg or wrapper inside a button, find the button
+                const btn = el.closest(
+                  'button, a, [role="button"], [role="link"], input[type="button"], input[type="submit"]'
+                );
+                if (btn && btn !== el) return btn;
+
+                // If el is a component or container, find the primary interactive button inside it
+                const innerActive = el.querySelector('button, [role="button"], a');
+                if (innerActive && innerActive !== el) return innerActive;
+
+                return null;
+              })
+              .catch(() => null);
+
+            const altEl = recoveryHandle?.asElement();
+            if (altEl) {
+              console.log('[Action Recovery]: Retrying click on alternative interactive control inside component...');
+              await altEl.click({ timeout: 2000, force: true }).catch(() => {});
+              await page.waitForTimeout(400);
+
+              const recPostUrl = page.url();
+              const recSnapshot = await page
+                .evaluate(() => {
+                  const el = document.querySelector(
+                    '[role="status"], [role="alert"], .alert, .modal, .toast, .confirmation, [aria-live="polite"]'
+                  );
+                  const notification =
+                    el && el.offsetWidth > 0 && el.offsetHeight > 0
+                      ? (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 100)
+                      : null;
+                  return {
+                    textLength: (document.body?.innerText || '').length,
+                    domCount: document.querySelectorAll('*').length,
+                    notification,
+                  };
+                })
+                .catch(() => null);
+
+              const isRecChanged =
+                recPostUrl !== preClickUrl ||
+                Boolean(recSnapshot?.notification) ||
+                Math.abs((recSnapshot?.textLength || 0) - preClickSnapshot.textLength) > 0;
+
+              if (isRecChanged) {
+                isDeadClick = false;
+                clickActual = `Click recovered: alternative locator dispatched on control within component and produced observable update${
+                  recSnapshot?.notification ? `: "${recSnapshot.notification}"` : '.'
+                }`;
+              }
+            }
+          } catch (_) {}
+
+          if (isDeadClick) {
+            clickActual = `Click dispatched on "${target.value || target.name || 'control'}" but produced no observable functional change (no-op/dead click). Action recovery re-evaluated component controls but observed no state transition.`;
+          }
+        }
       }
 
       return { actual: clickActual, isDeadClick };
@@ -1653,6 +1745,33 @@ async function resolveAgentLocator(page, target, timeout, decision = null, conte
     const isFillIntent = action === 'fill' || /\b(fill|type|enter|input|write)\b/i.test(combinedIntent);
     const isSelectIntent = action === 'select' || /\b(select|choose|pick|option|dropdown)\b/i.test(combinedIntent);
 
+    // Extract entity phrases for contextual component association
+    const entityPhrases = [];
+    if (target?.context) {
+      entityPhrases.push(String(target.context).trim().toLowerCase());
+    }
+    const rawThought = String(decision?.thought || '');
+    const quotedInThought = rawThought.match(/['"]([^'"]{2,50})['"]/g);
+    if (quotedInThought) {
+      for (const q of quotedInThought) {
+        const clean = q.replace(/^['"]|['"]$/g, '').trim().toLowerCase();
+        if (clean && clean !== String(target?.value || '').toLowerCase()) {
+          entityPhrases.push(clean);
+        }
+      }
+    }
+    const rawTargetStr = `${target?.value || ''} ${target?.name || ''}`.toLowerCase();
+    const entityContextClues = `${decision?.thought || ''} ${decision?.expectedOutcome || ''} ${context?.objective?.targetBehavior || ''}`;
+    const forMatch = entityContextClues.match(
+      /\b(?:for|on|in|of|item|product|card|row)\s+([A-Za-z0-9][A-Za-z0-9_\-\s]{2,40})/i
+    );
+    if (forMatch && forMatch[1]) {
+      const phrase = forMatch[1].trim().toLowerCase();
+      if (!phrase.includes(rawTargetStr)) {
+        entityPhrases.push(phrase);
+      }
+    }
+
     const stopWords = new Set([
       'the', 'and', 'for', 'with', 'that', 'this', 'from', 'click', 'button', 'select', 'test', 'verify',
       'page', 'should', 'will', 'have', 'been', 'user', 'action', 'element', 'control', 'role', 'text'
@@ -1699,9 +1818,32 @@ async function resolveAgentLocator(page, target, timeout, decision = null, conte
           const hasClickPointer = window.getComputedStyle(el).cursor === 'pointer';
           const ariaLabel = (el.getAttribute('aria-label') || el.getAttribute('title') || '').trim();
 
-          const container = el.closest(
-            'tr, article, section, li, [class*="card" i], [class*="row" i], [class*="item" i], form, fieldset, div'
-          );
+          const controlText = (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ').toLowerCase();
+
+          // Generic repeated component selectors
+          const explicitSelector =
+            'tr, article, section, li, figure, details, dialog, form, fieldset, [role="row"], [role="article"], [role="listitem"], [role="region"], [role="group"], [class*="card" i], [class*="item" i], [class*="row" i], [class*="product" i], [class*="tile" i], [class*="box" i], [class*="panel" i], [class*="entry" i], [class*="result" i], [class*="listing" i], [class*="record" i], [class*="accessory" i], [class*="addon" i], [class*="nested" i], [class*="component" i], [class*="option" i], [class*="offer" i], [data-testid*="card" i], [data-testid*="item" i], [data-testid*="row" i]';
+
+          // Ascend ancestors to find the closest component container that holds a heading or distinct semantic content
+          let container = null;
+          let curr = el.parentElement;
+          while (curr && curr !== document.body && curr !== document.documentElement) {
+            const isExplicit = curr.matches && curr.matches(explicitSelector);
+            const hasHeadings = Boolean(curr.querySelector('h1, h2, h3, h4, h5, h6, [role="heading"]'));
+            const currText = (curr.innerText || curr.textContent || '').trim().replace(/\s+/g, ' ');
+            const textDiff = currText.toLowerCase().replace(controlText, '').trim();
+
+            if (isExplicit || (hasHeadings && textDiff.length > 5)) {
+              container = curr;
+              break;
+            }
+            curr = curr.parentElement;
+          }
+
+          if (!container) {
+            container = el.closest('tr, article, section, li, form, fieldset, div') || el.parentElement;
+          }
+
           const containerText = container
             ? (container.innerText || container.textContent || '').trim().replace(/\s+/g, ' ').toLowerCase()
             : '';
@@ -1764,11 +1906,26 @@ async function resolveAgentLocator(page, target, timeout, decision = null, conte
 
       // Container contextual score
       let containerScore = 0;
-      if (keywords.length > 0 && meta.containerText.length > 0) {
-        for (const kw of keywords) {
-          if (meta.containerText.includes(kw)) {
-            containerScore += 15;
+      if (meta.containerText.length > 0) {
+        // 1. Full entity phrase matches (+80 per phrase match)
+        for (const ep of entityPhrases) {
+          if (meta.containerText.includes(ep)) {
+            containerScore += 80;
           }
+        }
+
+        // 2. Keyword matches (+15 per keyword match)
+        if (keywords.length > 0) {
+          for (const kw of keywords) {
+            if (meta.containerText.includes(kw)) {
+              containerScore += 15;
+            }
+          }
+        }
+
+        // 3. Positional tie-breaker if user requested "first" / "top" result and this is candidate 0
+        if (i === 0 && /\b(first|1st|top)\s*(result|item|product|match)?\b/i.test(combinedIntent)) {
+          containerScore += 5;
         }
       }
 
@@ -1849,6 +2006,83 @@ async function resolveAgentLocator(page, target, timeout, decision = null, conte
         return page.locator(val);
     }
   };
+
+  // Phase 4.9: Top-Down Component-Scoped Locator Resolution
+  const scopedEntityPhrases = [];
+  if (target?.context) {
+    scopedEntityPhrases.push(String(target.context).trim());
+  }
+  const rawThought = String(decision?.thought || '');
+  const quotedInThought = rawThought.match(/['"]([^'"]{2,50})['"]/g);
+  if (quotedInThought) {
+    for (const q of quotedInThought) {
+      const clean = q.replace(/^['"]|['"]$/g, '').trim();
+      if (clean && clean.toLowerCase() !== String(value || '').toLowerCase()) {
+        scopedEntityPhrases.push(clean);
+      }
+    }
+  }
+  const forMatch = rawThought.match(
+    /\b(?:for|on|in|of|item|product|card|row)\s+([A-Za-z0-9][A-Za-z0-9_\-\s]{2,40})/i
+  );
+  if (forMatch && forMatch[1]) {
+    const clean = forMatch[1].trim();
+    if (!clean.toLowerCase().includes(String(value || '').toLowerCase())) {
+      scopedEntityPhrases.push(clean);
+    }
+  }
+
+  if (scopedEntityPhrases.length > 0) {
+    const componentSelector =
+      'tr, article, section, li, figure, details, dialog, form, fieldset, [role="row"], [role="article"], [role="listitem"], [role="region"], [role="group"], [class*="card" i], [class*="item" i], [class*="row" i], [class*="product" i], [class*="tile" i], [class*="box" i], [class*="panel" i], [class*="entry" i], [class*="result" i], [class*="listing" i], [class*="record" i], [class*="accessory" i], [class*="addon" i], [class*="nested" i], [class*="component" i], [class*="option" i], [class*="offer" i], [data-testid*="card" i], [data-testid*="item" i], [data-testid*="row" i]';
+
+    for (const phrase of scopedEntityPhrases) {
+      const escPhrase = escapeRegex(phrase);
+      const compMatches = page.locator(componentSelector).filter({ hasText: new RegExp(escPhrase, 'i') });
+      const compCount = await compMatches.count().catch(() => 0);
+      if (compCount >= 1) {
+        // If nested matching components exist, choose the most specific (innermost) component
+        let comp = compMatches.first();
+        if (compCount > 1) {
+          let minLen = Infinity;
+          for (let c = 0; c < compCount; c++) {
+            const candidateComp = compMatches.nth(c);
+            const textLen = await candidateComp
+              .evaluate((el) => (el.innerText || el.textContent || '').trim().length)
+              .catch(() => Infinity);
+            if (textLen < minLen) {
+              minLen = textLen;
+              comp = candidateComp;
+            }
+          }
+        }
+
+        if (await comp.isVisible({ timeout: 500 }).catch(() => false)) {
+          const scopedControl = comp.locator(buildPrimaryLocator(strategy, value, name));
+          const scopedCount = await scopedControl.count().catch(() => 0);
+          if (scopedCount === 1) {
+            if (await scopedControl.first().isVisible({ timeout: 500 }).catch(() => false)) {
+              console.log(
+                `[Component Scoping]: Resolved control "${value || name}" scoped within component matching "${phrase}".`
+              );
+              return scopedControl.first();
+            }
+          } else if (scopedCount > 1) {
+            const scopedCandidates = [];
+            for (let s = 0; s < scopedCount; s++) {
+              const sc = scopedControl.nth(s);
+              if (await sc.isVisible({ timeout: 300 }).catch(() => false)) {
+                scopedCandidates.push(sc);
+              }
+            }
+            if (scopedCandidates.length > 0) {
+              return await disambiguateCandidates(scopedCandidates, name || value, strategy);
+            }
+          }
+        }
+      }
+    }
+  }
 
   const primaryLocator = buildPrimaryLocator(strategy, value, name);
 
