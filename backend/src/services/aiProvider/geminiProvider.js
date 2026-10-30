@@ -55,8 +55,10 @@ Requirements:
   2. If testing invalid login, use deliberately invalid credentials (e.g., "invalid_user", "wrong_password") to verify that access is denied.
   3. Valid login testing requires provided test credentials.
   4. When testing BOTH valid and invalid login, test invalid login first (to verify denial), then log in with valid credentials so the session remains in a valid authenticated state for subsequent objectives.
-  5. If subsequent objectives genuinely require an authenticated session (e.g. private profile, restricted order history), set "requiresAuth": true and specify "dependsOn": ["<login-objective-id>"].
-  6. Public features (such as public search, product browsing, or footer links) do NOT require an authenticated session unless the website strictly restricts them behind login.
+  5. Independent authentication tests: Testing invalid login, locked-out user, problem-user, or performance-glitch user are independent authentication tests. Do NOT make them depend on each other (leave "dependsOn": []).
+  6. Public features (such as landing page inspection, public search, product browsing, or footer links) do NOT require an authenticated session and must NOT list login in "dependsOn": [].
+  7. If subsequent objectives genuinely require an authenticated session (e.g. private profile, cart checkout, restricted order history), set "requiresAuth": true and specify "dependsOn": ["<valid-login-objective-id>"].
+  8. ONLY specify "dependsOn" when an objective genuinely requires the specific output or authenticated state of a prior objective.
 - Return ONLY valid JSON matching this schema:
 {
   "objectives": [
@@ -252,6 +254,11 @@ Available Actions:
 - "assertText": target, value: string, exact?: boolean
 - "assertDateSync": verify that the displayed day of the week matches the actual system date
 - "conclude": outcome: "PASS"|"FAIL"|"BLOCKED"|"NEEDS_CLARIFICATION", reasoning: string, failureAnalysis?: { description, hypothesis, stepsToReproduce }
+
+Canonical Target Strategy Rules:
+- Target "strategy" MUST be one of ONLY 5 supported values: "role", "label", "placeholder", "text", "css".
+- CRITICAL: Strategies such as "name", "id", "xpath", or "class" are NOT supported and will trigger schema validation errors.
+- To target an element by HTML name attribute, ID, or class, use strategy "css" with a standard CSS attribute selector (e.g. {"strategy": "css", "value": "[name=\"user-name\"]"} or {"strategy": "css", "value": "#user-name"}).
 
 Decision Rules:
 - Prioritize accessible roles, labels, and text over raw CSS classes.

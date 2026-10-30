@@ -37,12 +37,138 @@ export const AGENT_ACTIONS = [
 export const LOCATOR_STRATEGIES = ['role', 'label', 'placeholder', 'text', 'css'];
 
 /**
+ * Safely repairs an unsupported target strategy into a canonical strategy.
+ * Preserves the original target meaning and action intent.
+ * Never silently substitutes an arbitrary locator strategy.
+ *
+ * @param {object} target
+ * @param {object} [observation]
+ * @returns {{ repaired: boolean, target?: object, error?: string, repairDetails?: object }}
+ */
+export function repairTargetStrategy(target, observation = null) {
+  if (!target || typeof target !== 'object') {
+    return { repaired: false, error: 'Target must be a non-null object.' };
+  }
+
+  const { strategy, value, name } = target;
+  if (!strategy || typeof strategy !== 'string') {
+    return { repaired: false, error: 'Target missing strategy.' };
+  }
+
+  const rawStrategy = strategy.trim().toLowerCase();
+
+  // If already canonical, return unchanged
+  if (LOCATOR_STRATEGIES.includes(rawStrategy)) {
+    return { repaired: false, target };
+  }
+
+  const targetVal = typeof value === 'string' ? value.trim() : '';
+  if (!targetVal) {
+    return {
+      repaired: false,
+      error: `Cannot repair unsupported strategy "${strategy}" with empty target value.`,
+    };
+  }
+
+  // 1. Strategy "name": W3C HTML attribute name -> CSS [name="..."]
+  if (rawStrategy === 'name') {
+    const escapedVal = targetVal.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    const repairedCss = `[name="${escapedVal}"]`;
+    return {
+      repaired: true,
+      target: {
+        ...target,
+        strategy: 'css',
+        value: repairedCss,
+      },
+      repairDetails: {
+        originalStrategy: 'name',
+        repairedStrategy: 'css',
+        originalValue: targetVal,
+        repairedValue: repairedCss,
+        reason: 'Converted unsupported "name" strategy to canonical CSS attribute selector [name="..."] preserving exact target attribute.',
+      },
+    };
+  }
+
+  // 2. Strategy "id": HTML id -> CSS [id="..."]
+  if (rawStrategy === 'id') {
+    const escapedVal = targetVal.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    const repairedCss = `[id="${escapedVal}"]`;
+    return {
+      repaired: true,
+      target: {
+        ...target,
+        strategy: 'css',
+        value: repairedCss,
+      },
+      repairDetails: {
+        originalStrategy: 'id',
+        repairedStrategy: 'css',
+        originalValue: targetVal,
+        repairedValue: repairedCss,
+        reason: 'Converted unsupported "id" strategy to canonical CSS attribute selector [id="..."] preserving exact target attribute.',
+      },
+    };
+  }
+
+  // 3. Strategy "class" or "classname": CSS class selector
+  if (rawStrategy === 'class' || rawStrategy === 'classname') {
+    const repairedCss = targetVal.startsWith('.') ? targetVal : `.${targetVal.replace(/\s+/g, '.')}`;
+    return {
+      repaired: true,
+      target: {
+        ...target,
+        strategy: 'css',
+        value: repairedCss,
+      },
+      repairDetails: {
+        originalStrategy: strategy,
+        repairedStrategy: 'css',
+        originalValue: targetVal,
+        repairedValue: repairedCss,
+        reason: 'Converted unsupported class strategy to canonical CSS class selector.',
+      },
+    };
+  }
+
+  // 4. Strategy "tag" or "tagname": CSS element selector
+  if (rawStrategy === 'tag' || rawStrategy === 'tagname') {
+    return {
+      repaired: true,
+      target: {
+        ...target,
+        strategy: 'css',
+        value: targetVal.toLowerCase(),
+      },
+      repairDetails: {
+        originalStrategy: strategy,
+        repairedStrategy: 'css',
+        originalValue: targetVal,
+        repairedValue: targetVal.toLowerCase(),
+        reason: 'Converted unsupported tag strategy to canonical CSS tag selector.',
+      },
+    };
+  }
+
+  // Unknown or arbitrary strategy -> do not guess!
+  return {
+    repaired: false,
+    error: `Target strategy "${strategy}" is invalid and cannot be safely repaired. Allowed strategies: ${LOCATOR_STRATEGIES.join(', ')}.`,
+  };
+}
+
+/**
  * Validates action decision from AI provider against strict schema.
+ * Supports bounded, safe target strategy repair when allowed.
  *
  * @param {object} decision
- * @returns {{ valid: boolean, error?: string }}
+ * @param {object} [options]
+ * @param {boolean} [options.allowRepair=true]
+ * @param {object} [options.observation]
+ * @returns {{ valid: boolean, repaired?: boolean, repairDetails?: object, error?: string }}
  */
-export function validateAgentDecision(decision) {
+export function validateAgentDecision(decision, options = {}) {
   if (!decision || typeof decision !== 'object') {
     return { valid: false, error: 'Model decision must be a non-null object.' };
   }
@@ -80,9 +206,20 @@ export function validateAgentDecision(decision) {
       return { valid: false, error: `Action "${action}" requires a valid "target" object.` };
     }
     if (!target.strategy || !LOCATOR_STRATEGIES.includes(target.strategy)) {
+      const repairRes = options.allowRepair !== false ? repairTargetStrategy(target, options.observation) : null;
+      if (repairRes?.repaired && repairRes.target) {
+        decision.target = repairRes.target;
+        return {
+          valid: true,
+          repaired: true,
+          repairDetails: repairRes.repairDetails,
+        };
+      }
       return {
         valid: false,
-        error: `Target strategy "${target.strategy}" is invalid. Allowed: ${LOCATOR_STRATEGIES.join(', ')}.`,
+        error:
+          repairRes?.error ||
+          `Target strategy "${target.strategy}" is invalid. Allowed: ${LOCATOR_STRATEGIES.join(', ')}.`,
       };
     }
     if (!target.value || typeof target.value !== 'string' || !target.value.trim()) {

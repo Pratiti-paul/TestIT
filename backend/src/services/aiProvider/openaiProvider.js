@@ -32,7 +32,10 @@ Requirements:
 - If testing invalid login, use deliberately invalid credentials (e.g. "invalid_user", "wrong_password") to verify access rejection.
 - Valid login testing requires provided test credentials.
 - When testing both valid and invalid login, test invalid login first, then valid login to establish an authenticated session.
-- Only mark requiresAuth: true if an objective strictly requires an active, authenticated session (e.g. private profile).
+- Independent authentication tests: Testing invalid login, locked-out user, problem-user, or performance-glitch user are independent authentication tests. Do NOT make them depend on each other (leave "dependsOn": []).
+- Public features (such as landing page inspection, public search, product browsing, or footer links) do NOT require an authenticated session and must NOT list login in "dependsOn": [].
+- Only mark requiresAuth: true if an objective strictly requires an active, authenticated session (e.g. private profile, cart checkout, restricted order history) and set dependsOn to the valid-login objective ID.
+- ONLY specify "dependsOn" when an objective genuinely requires the specific output or authenticated state of a prior objective.
 - Return JSON matching { "objectives": [ { "id": "obj-1", "description": string, "targetBehavior": string, "expectedOutcome": string, "preconditions": string[], "dependsOn"?: string[], "requiresAuth"?: boolean, "safetyRestrictions": string[] } ] }`;
 
     const userPrompt = `Website: ${url}\nInstructions: "${instructions}"\nCredentials: ${
@@ -143,6 +146,7 @@ Requirements:
     const systemInstruction = `You are TestIT AI, an autonomous QA agent executing an Observe-Plan-Act-Verify loop.
 Based on the live page observation and action history, select the next single Playwright action or conclude.
 Rules:
+- Canonical Target Strategy: Target "strategy" MUST be one of ONLY 5 allowed values: "role", "label", "placeholder", "text", "css". Strategies like "name", "id", "xpath", or "class" are NOT supported. To target an element by name attribute or ID, use strategy "css" with a standard CSS attribute selector (e.g. {"strategy": "css", "value": "[name=\"user-name\"]"} or {"strategy": "css", "value": "#user-name"}).
 - Generic & Prompt-Driven: The user's plain-English instruction dictates what to test. NEVER assume a website follows a specific pre-baked workflow or structure.
 - Ambiguous Controls: If multiple identical controls exist for an action (e.g. multiple "Select", "Delete", or "Add" buttons), compare surrounding cards, rows, or labels. If ambiguity remains without distinguishing context, conclude with "BLOCKED" or "NEEDS_CLARIFICATION". NEVER guess an arbitrary candidate.
 - Real Application State Verification: A button click, modal popup, or toast notification alone does NOT establish PASS. Verify the persistent underlying state (e.g. item present in table, cart count updated, database record listed). If a success toast appears but the list/table/cart remains empty, conclude with "FAIL".

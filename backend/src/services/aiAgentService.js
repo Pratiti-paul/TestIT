@@ -511,8 +511,8 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
           break;
         }
 
-        // Validate decision schema
-        const decisionCheck = validateAgentDecision(decision);
+        // Validate decision schema & attempt safe bounded repair
+        const decisionCheck = validateAgentDecision(decision, { observation, allowRepair: true });
         if (!decisionCheck.valid) {
           objectiveOutcome = 'ERROR';
           objectiveFailure = {
@@ -521,6 +521,25 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
           };
           objectiveFinished = true;
           break;
+        }
+
+        if (decisionCheck.repaired && decisionCheck.repairDetails) {
+          console.log('[Action Schema Repair]:', JSON.stringify(decisionCheck.repairDetails));
+        }
+
+        // Detect and resolve reasoning vs action value mismatch
+        const mismatchCheck = detectActionReasoningMismatch(decision, { credentials, objective });
+        if (!mismatchCheck.valid) {
+          objectiveOutcome = 'ERROR';
+          objectiveFailure = {
+            description: mismatchCheck.error,
+            hypothesis: 'Model reasoning intent conflicted with executable action value.',
+          };
+          objectiveFinished = true;
+          break;
+        }
+        if (mismatchCheck.mismatch && mismatchCheck.details) {
+          console.log('[Action Reasoning Mismatch Repaired]:', JSON.stringify(mismatchCheck.details));
         }
 
         // Handle conclusion
@@ -1013,9 +1032,15 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
             authFailed = false;
           }
         } else {
-          authFailed = true;
-          authSucceeded = false;
-          sessionIsAuthenticated = false;
+          if (testsValid) {
+            authFailed = true;
+            authSucceeded = false;
+            sessionIsAuthenticated = false;
+          } else {
+            // Failure of an invalid-only or negative test does NOT mean valid authentication failed
+            authSucceeded = false;
+            sessionIsAuthenticated = false;
+          }
         }
       }
 
@@ -1603,8 +1628,39 @@ async function executeAgentAction(page, decision, timeout, context) {
           }
           displayValue = `"${textToFill}"`;
         } else {
-          // Exact preservation: AI model must NEVER overwrite, truncate or regenerate supplied username/email
-          textToFill = context.credentials?.username ? context.credentials.username : rawVal;
+          // Check if rawVal is a placeholder or attempted match for the supplied credentials
+          const isPlaceholder =
+            rawVal === '[VALID_USERNAME]' ||
+            rawVal === '' ||
+            rawVal === '""' ||
+            rawVal === "''" ||
+            rawVal === '[VALID_USER]';
+
+          const suppliedUser = context.credentials?.username || '';
+          const isAttemptedSuppliedMatch =
+            Boolean(suppliedUser) &&
+            (rawVal.toLowerCase() === suppliedUser.toLowerCase() ||
+              (suppliedUser.includes('@') && rawVal.toLowerCase() === suppliedUser.split('@')[0].toLowerCase()) ||
+              (rawVal.length < suppliedUser.length && suppliedUser.toLowerCase().startsWith(rawVal.toLowerCase())));
+
+          if (suppliedUser && (isPlaceholder || isAttemptedSuppliedMatch || hasValidIntent)) {
+            // If the action explicitly targets an alternative test user (e.g. problem_user, locked_out_user)
+            // that is distinctly different from the supplied user, preserve the intended test user!
+            const isDistinctAlternativeUser =
+              Boolean(rawVal) &&
+              !isPlaceholder &&
+              rawVal.toLowerCase() !== suppliedUser.toLowerCase() &&
+              !isAttemptedSuppliedMatch;
+
+            if (isDistinctAlternativeUser) {
+              textToFill = rawVal;
+            } else {
+              // Exact preservation: AI model must NEVER overwrite, truncate or regenerate supplied username/email
+              textToFill = suppliedUser;
+            }
+          } else {
+            textToFill = rawVal || suppliedUser || 'user@example.com';
+          }
           displayValue = `"${textToFill}"`;
         }
       } else {
@@ -2001,6 +2057,14 @@ async function resolveAgentLocator(page, target, timeout, decision = null, conte
       case 'text': {
         return page.getByText(val);
       }
+      case 'name': {
+        const escaped = String(val).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+        return page.locator(`[name="${escaped}"]`);
+      }
+      case 'id': {
+        const escaped = String(val).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+        return page.locator(`[id="${escaped}"]`);
+      }
       case 'css':
       default:
         return page.locator(val);
@@ -2289,6 +2353,79 @@ async function resolveAgentLocator(page, target, timeout, decision = null, conte
   );
   notFoundErr.statusType = 'FAIL';
   throw notFoundErr;
+}
+
+/**
+ * Detects whether the model's reasoning/thought and its action value contradict each other.
+ * If safe repair is possible (e.g. thought clearly specified intended test user), repairs decision.value.
+ * If repair fails or intent is conflicting, returns a structured error.
+ *
+ * @param {object} decision
+ * @param {object} [context]
+ * @returns {{ valid: boolean, repaired?: boolean, mismatch?: boolean, error?: string, details?: object }}
+ */
+export function detectActionReasoningMismatch(decision, context = {}) {
+  if (!decision || typeof decision !== 'object') return { valid: true };
+  if (decision.action !== 'fill') return { valid: true };
+
+  const thought = String(decision.thought || '').trim();
+  const rawValue = String(decision.value !== undefined && decision.value !== null ? decision.value : '').trim();
+  if (!thought) return { valid: true };
+
+  // Check if thought explicitly states an intention to fill a specific username or credential
+  const quotedMatches = thought.match(/['"]([a-zA-Z0-9_\-\.\@]{3,40})['"]/g);
+  let explicitIntendedVal = null;
+  if (quotedMatches) {
+    for (const q of quotedMatches) {
+      const clean = q.replace(/^['"]|['"]$/g, '').trim();
+      if (
+        !/^(?:email|username|user|password|login|text|input|value|button|submit|click|placeholder|selector|id|name|form|field|patient|contact|phone|data)$/i.test(
+          clean
+        )
+      ) {
+        explicitIntendedVal = clean;
+        break;
+      }
+    }
+  }
+
+  if (!explicitIntendedVal) {
+    const valueMatch = thought.match(
+      /\b(?:with|as|value|named|account)\s+['"]?([a-zA-Z0-9_\-\.\@]{3,30})['"]?\b/i
+    );
+    if (valueMatch && valueMatch[1]) {
+      const cand = valueMatch[1].trim();
+      if (
+        !/^(?:the|into|with|field|input|box|form|valid|invalid|credentials?|login|username|password|patient|contact|phone|email|name|data|text|value|search|query|details)$/i.test(
+          cand
+        )
+      ) {
+        explicitIntendedVal = cand;
+      }
+    }
+  }
+
+  if (explicitIntendedVal) {
+    // If thought explicitly specifies an intended test value (like "problem_user")
+    // but action value has a different value (e.g. "[VALID_USERNAME]" or "standard_user")
+    if (rawValue.toLowerCase() !== explicitIntendedVal.toLowerCase()) {
+      const originalValue = rawValue;
+      decision.value = explicitIntendedVal;
+      return {
+        valid: true,
+        repaired: true,
+        mismatch: true,
+        details: {
+          intendedFromReasoning: explicitIntendedVal,
+          actionValue: originalValue,
+          repairedTo: explicitIntendedVal,
+          reason: `Model reasoning specifically intended to enter "${explicitIntendedVal}", but action value was "${originalValue}". Repaired action value to match explicit reasoning intent.`,
+        },
+      };
+    }
+  }
+
+  return { valid: true };
 }
 
 /**
@@ -2706,19 +2843,31 @@ export function checkObjectiveDependencies(
     if (failedObjectiveIds && failedObjectiveIds.has(depId)) {
       const depObj = plannedObjectives.find((o) => (o.id || o.objectiveId) === depId);
       const isDepAuthObjective = depObj ? isLoginVerificationObjective(depObj) : false;
+      const isDepInvalidOnly = depObj ? (isLoginVerificationObjective(depObj) && !requiresValidCredentials(depObj)) : false;
       const isCurrentAuthObjective = isLoginVerificationObjective(objective);
       const currentRequiresAuth = requiresAuthenticatedSession(objective);
 
-      // If the current objective is an independent public objective (does NOT require authentication)
-      // and the failed prerequisite was an authentication objective, allow the public objective to run!
-      if (!currentRequiresAuth && !isCurrentAuthObjective && isDepAuthObjective) {
+      // Independent objectives:
+      // 1. If prerequisite was an invalid-only login test, it never blocks subsequent independent tests
+      if (isDepInvalidOnly) {
+        continue;
+      }
+      // 2. If current objective is an independent login test (testing valid login or another user), it can run independently
+      if (isCurrentAuthObjective) {
+        continue;
+      }
+      // 3. If current objective is an independent public flow (does not require auth), it can run independently
+      if (!currentRequiresAuth && !isCurrentAuthObjective) {
         continue;
       }
 
       return {
         canRun: false,
         status: 'SKIPPED',
-        reason: `Skipped: Prerequisite objective "${depId}" failed or was not satisfied.`,
+        reason:
+          currentRequiresAuth && isDepAuthObjective
+            ? 'Skipped: Requires an authenticated session, but earlier authentication verification failed.'
+            : `Skipped: Prerequisite objective "${depId}" failed or was not satisfied.`,
       };
     }
   }
@@ -2729,17 +2878,27 @@ export function checkObjectiveDependencies(
       if (typeof p === 'string' && failedObjectiveIds && failedObjectiveIds.has(p)) {
         const depObj = plannedObjectives.find((o) => (o.id || o.objectiveId) === p);
         const isDepAuthObjective = depObj ? isLoginVerificationObjective(depObj) : false;
+        const isDepInvalidOnly = depObj ? (isLoginVerificationObjective(depObj) && !requiresValidCredentials(depObj)) : false;
         const isCurrentAuthObjective = isLoginVerificationObjective(objective);
         const currentRequiresAuth = requiresAuthenticatedSession(objective);
 
-        if (!currentRequiresAuth && !isCurrentAuthObjective && isDepAuthObjective) {
+        if (isDepInvalidOnly) {
+          continue;
+        }
+        if (isCurrentAuthObjective) {
+          continue;
+        }
+        if (!currentRequiresAuth && !isCurrentAuthObjective) {
           continue;
         }
 
         return {
           canRun: false,
           status: 'SKIPPED',
-          reason: `Skipped: Prerequisite objective "${p}" failed or was not satisfied.`,
+          reason:
+            currentRequiresAuth && isDepAuthObjective
+              ? 'Skipped: Requires an authenticated session, but earlier authentication verification failed.'
+              : `Skipped: Prerequisite objective "${p}" failed or was not satisfied.`,
         };
       }
     }
