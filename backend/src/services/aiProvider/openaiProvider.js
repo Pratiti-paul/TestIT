@@ -3,11 +3,22 @@
  * Interacts with OpenAI Chat Completions API.
  */
 
+import {
+  ProviderError,
+  createProviderHttpError,
+  wrapProviderError,
+} from './providerSanitizer.js';
+
 export class OpenAiProvider {
-  constructor(apiKey, model = 'gpt-4o-mini') {
+  constructor(apiKey, model = 'gpt-4o-mini', options = {}) {
     this.apiKey = apiKey;
     this.model = model;
     this.name = 'openai';
+    this.timeoutMs =
+      options.timeoutMs ||
+      (process.env.AI_PROVIDER_TIMEOUT_MS ? parseInt(process.env.AI_PROVIDER_TIMEOUT_MS, 10) : 15000);
+    this.maxPlanningTokens = options.maxPlanningTokens || 1024;
+    this.maxStepTokens = options.maxStepTokens || 800;
   }
 
   async planObjectives({ url, instructions, credentials = {} }) {
@@ -21,40 +32,105 @@ Return JSON matching { "objectives": [ { "id": "obj-1", "description": string, "
       credentials?.username ? 'Available' : 'None'
     }`;
 
-    const response = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${this.apiKey}`,
-      },
-      body: JSON.stringify({
-        model: this.model,
-        response_format: { type: 'json_object' },
-        temperature: 0.1,
-        messages: [
-          { role: 'system', content: systemInstruction },
-          { role: 'user', content: userPrompt },
-        ],
-      }),
-    });
+    try {
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${this.apiKey}`,
+        },
+        body: JSON.stringify({
+          model: this.model,
+          response_format: { type: 'json_object' },
+          temperature: 0.1,
+          max_tokens: this.maxPlanningTokens,
+          messages: [
+            { role: 'system', content: systemInstruction },
+            { role: 'user', content: userPrompt },
+          ],
+        }),
+        signal: AbortSignal.timeout(this.timeoutMs),
+      });
 
-    if (!response.ok) {
-      const errText = await response.text().catch(() => '');
-      throw new Error(`OpenAI API returned HTTP ${response.status}: ${errText.slice(0, 200)}`);
+      if (!response.ok) {
+        const errText = await response.text().catch(() => '');
+        throw createProviderHttpError({
+          providerName: 'OpenAI',
+          status: response.status,
+          rawBody: errText,
+          apiKey: this.apiKey,
+        });
+      }
+
+      const data = await response.json().catch(() => {
+        throw new ProviderError('OpenAI API returned an unparseable response payload.', {
+          providerName: 'OpenAI',
+          category: 'malformed_response',
+        });
+      });
+
+      const choice = data?.choices?.[0];
+      if (!choice) {
+        throw new ProviderError('OpenAI API returned no choices in response.', {
+          providerName: 'OpenAI',
+          category: 'malformed_response',
+        });
+      }
+
+      if (choice.finish_reason === 'length') {
+        throw new ProviderError(
+          'OpenAI output was truncated due to output token limits (finish_reason: length).',
+          {
+            providerName: 'OpenAI',
+            category: 'malformed_response',
+          }
+        );
+      }
+
+      const content = choice?.message?.content;
+      if (!content || !content.trim()) {
+        throw new ProviderError('OpenAI API returned an empty response during test objective planning.', {
+          providerName: 'OpenAI',
+          category: 'malformed_response',
+        });
+      }
+
+      let parsed;
+      try {
+        parsed = JSON.parse(content);
+      } catch {
+        throw new ProviderError('OpenAI response could not be parsed as valid JSON.', {
+          providerName: 'OpenAI',
+          category: 'malformed_response',
+        });
+      }
+
+      if (!Array.isArray(parsed.objectives) || parsed.objectives.length === 0) {
+        throw new ProviderError('OpenAI response did not contain an array of test objectives.', {
+          providerName: 'OpenAI',
+          category: 'malformed_response',
+        });
+      }
+
+      return parsed;
+    } catch (err) {
+      if (err instanceof ProviderError) throw err;
+      throw wrapProviderError(err, {
+        providerName: 'OpenAI',
+        apiKey: this.apiKey,
+        timeoutMs: this.timeoutMs,
+      });
     }
-
-    const data = await response.json();
-    const content = data?.choices?.[0]?.message?.content;
-    const parsed = JSON.parse(content);
-
-    if (!Array.isArray(parsed.objectives) || parsed.objectives.length === 0) {
-      throw new Error('OpenAI response did not contain an array of test objectives.');
-    }
-
-    return parsed;
   }
 
-  async decideNextStep({ objective, observation, history = [], credentials = {}, stepNumber = 1, maxSteps = 15 }) {
+  async decideNextStep({
+    objective,
+    observation,
+    history = [],
+    credentials = {},
+    stepNumber = 1,
+    maxSteps = 15,
+  }) {
     const endpoint = 'https://api.openai.com/v1/chat/completions';
 
     const systemInstruction = `You are TestIT AI, an autonomous QA agent executing an Observe-Plan-Act-Verify loop.
@@ -91,31 +167,84 @@ Return JSON with:
       hasCredentials: Boolean(credentials?.username),
     };
 
-    const response = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${this.apiKey}`,
-      },
-      body: JSON.stringify({
-        model: this.model,
-        response_format: { type: 'json_object' },
-        temperature: 0.1,
-        messages: [
-          { role: 'system', content: systemInstruction },
-          { role: 'user', content: JSON.stringify(promptContext) },
-        ],
-      }),
-    });
+    try {
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${this.apiKey}`,
+        },
+        body: JSON.stringify({
+          model: this.model,
+          response_format: { type: 'json_object' },
+          temperature: 0.1,
+          max_tokens: this.maxStepTokens,
+          messages: [
+            { role: 'system', content: systemInstruction },
+            { role: 'user', content: JSON.stringify(promptContext) },
+          ],
+        }),
+        signal: AbortSignal.timeout(this.timeoutMs),
+      });
 
-    if (!response.ok) {
-      const errText = await response.text().catch(() => '');
-      throw new Error(`OpenAI API step decision failed (HTTP ${response.status}): ${errText.slice(0, 200)}`);
+      if (!response.ok) {
+        const errText = await response.text().catch(() => '');
+        throw createProviderHttpError({
+          providerName: 'OpenAI',
+          status: response.status,
+          rawBody: errText,
+          apiKey: this.apiKey,
+        });
+      }
+
+      const data = await response.json().catch(() => {
+        throw new ProviderError('OpenAI API returned an unparseable response payload.', {
+          providerName: 'OpenAI',
+          category: 'malformed_response',
+        });
+      });
+
+      const choice = data?.choices?.[0];
+      if (!choice) {
+        throw new ProviderError('OpenAI API returned no choices in response.', {
+          providerName: 'OpenAI',
+          category: 'malformed_response',
+        });
+      }
+
+      if (choice.finish_reason === 'length') {
+        throw new ProviderError(
+          'OpenAI output was truncated due to output token limits (finish_reason: length).',
+          {
+            providerName: 'OpenAI',
+            category: 'malformed_response',
+          }
+        );
+      }
+
+      const content = choice?.message?.content;
+      if (!content || !content.trim()) {
+        throw new ProviderError('OpenAI API returned an empty step decision response.', {
+          providerName: 'OpenAI',
+          category: 'malformed_response',
+        });
+      }
+
+      try {
+        return JSON.parse(content);
+      } catch {
+        throw new ProviderError('OpenAI step decision response could not be parsed as valid JSON.', {
+          providerName: 'OpenAI',
+          category: 'malformed_response',
+        });
+      }
+    } catch (err) {
+      if (err instanceof ProviderError) throw err;
+      throw wrapProviderError(err, {
+        providerName: 'OpenAI',
+        apiKey: this.apiKey,
+        timeoutMs: this.timeoutMs,
+      });
     }
-
-    const data = await response.json();
-    const content = data?.choices?.[0]?.message?.content;
-    return JSON.parse(content);
   }
 }
-

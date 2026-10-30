@@ -3,11 +3,22 @@
  * Interacts with Google Generative Language REST API.
  */
 
+import {
+  ProviderError,
+  createProviderHttpError,
+  wrapProviderError,
+} from './providerSanitizer.js';
+
 export class GeminiProvider {
-  constructor(apiKey, model = 'gemini-2.5-flash') {
+  constructor(apiKey, model = 'gemini-2.5-flash', options = {}) {
     this.apiKey = apiKey;
     this.model = model;
     this.name = 'gemini';
+    this.timeoutMs =
+      options.timeoutMs ||
+      (process.env.AI_PROVIDER_TIMEOUT_MS ? parseInt(process.env.AI_PROVIDER_TIMEOUT_MS, 10) : 15000);
+    this.maxPlanningTokens = options.maxPlanningTokens || 1024;
+    this.maxStepTokens = options.maxStepTokens || 800;
   }
 
   /**
@@ -20,7 +31,8 @@ export class GeminiProvider {
    * @returns {Promise<{ objectives: Array<{ id: string, description: string, targetBehavior: string, expectedOutcome: string, preconditions: string[] }> }>}
    */
   async planObjectives({ url, instructions, credentials = {} }) {
-    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${this.model}:generateContent?key=${this.apiKey}`;
+    // Authenticate via standard x-goog-api-key request header to avoid embedding secret in URL
+    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${this.model}:generateContent`;
 
     const systemInstruction = `You are TestIT AI, an expert autonomous QA testing agent.
 Your job is to analyze the user's natural-language website testing instructions and break them down into 1 to 4 concrete, testable objectives.
@@ -49,35 +61,93 @@ Requirements:
 User Instructions: "${instructions}"
 Test Credentials Available: ${credentials?.username ? 'Yes (Username/Password provided)' : 'None'}`;
 
-    const response = await fetch(endpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{ role: 'user', parts: [{ text: `${systemInstruction}\n\n${userPrompt}` }] }],
-        generationConfig: {
-          responseMimeType: 'application/json',
-          temperature: 0.1,
+    try {
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': this.apiKey,
         },
-      }),
-    });
+        body: JSON.stringify({
+          contents: [{ role: 'user', parts: [{ text: `${systemInstruction}\n\n${userPrompt}` }] }],
+          generationConfig: {
+            responseMimeType: 'application/json',
+            temperature: 0.1,
+            maxOutputTokens: this.maxPlanningTokens,
+          },
+        }),
+        signal: AbortSignal.timeout(this.timeoutMs),
+      });
 
-    if (!response.ok) {
-      const errText = await response.text().catch(() => '');
-      throw new Error(`Gemini API returned HTTP ${response.status}: ${errText.slice(0, 200)}`);
+      if (!response.ok) {
+        const errText = await response.text().catch(() => '');
+        throw createProviderHttpError({
+          providerName: 'Gemini',
+          status: response.status,
+          rawBody: errText,
+          apiKey: this.apiKey,
+        });
+      }
+
+      const data = await response.json().catch(() => {
+        throw new ProviderError('Gemini API returned an unparseable response payload.', {
+          providerName: 'Gemini',
+          category: 'malformed_response',
+        });
+      });
+
+      const candidate = data?.candidates?.[0];
+      if (!candidate) {
+        throw new ProviderError('Gemini API returned no candidates in response.', {
+          providerName: 'Gemini',
+          category: 'malformed_response',
+        });
+      }
+
+      if (candidate.finishReason === 'MAX_TOKENS') {
+        throw new ProviderError(
+          'Gemini output was truncated due to output token limits (finishReason: MAX_TOKENS).',
+          {
+            providerName: 'Gemini',
+            category: 'malformed_response',
+          }
+        );
+      }
+
+      const rawJson = candidate?.content?.parts?.[0]?.text;
+      if (!rawJson || !rawJson.trim()) {
+        throw new ProviderError('Gemini API returned an empty response during test objective planning.', {
+          providerName: 'Gemini',
+          category: 'malformed_response',
+        });
+      }
+
+      let parsed;
+      try {
+        parsed = JSON.parse(rawJson);
+      } catch {
+        throw new ProviderError('Gemini response could not be parsed as valid JSON.', {
+          providerName: 'Gemini',
+          category: 'malformed_response',
+        });
+      }
+
+      if (!Array.isArray(parsed.objectives) || parsed.objectives.length === 0) {
+        throw new ProviderError('Gemini response did not contain an array of test objectives.', {
+          providerName: 'Gemini',
+          category: 'malformed_response',
+        });
+      }
+
+      return parsed;
+    } catch (err) {
+      if (err instanceof ProviderError) throw err;
+      throw wrapProviderError(err, {
+        providerName: 'Gemini',
+        apiKey: this.apiKey,
+        timeoutMs: this.timeoutMs,
+      });
     }
-
-    const data = await response.json();
-    const rawJson = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!rawJson) {
-      throw new Error('Gemini API returned an empty response during test objective planning.');
-    }
-
-    const parsed = JSON.parse(rawJson);
-    if (!Array.isArray(parsed.objectives) || parsed.objectives.length === 0) {
-      throw new Error('Gemini response did not contain an array of test objectives.');
-    }
-
-    return parsed;
   }
 
   /**
@@ -92,8 +162,16 @@ Test Credentials Available: ${credentials?.username ? 'Yes (Username/Password pr
    * @param {number} params.maxSteps - Maximum allowable steps
    * @returns {Promise<object>} Next action decision or conclusion
    */
-  async decideNextStep({ objective, observation, history = [], credentials = {}, stepNumber = 1, maxSteps = 15 }) {
-    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${this.model}:generateContent?key=${this.apiKey}`;
+  async decideNextStep({
+    objective,
+    observation,
+    history = [],
+    credentials = {},
+    stepNumber = 1,
+    maxSteps = 15,
+  }) {
+    // Authenticate via standard x-goog-api-key request header to avoid embedding secret in URL
+    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${this.model}:generateContent`;
 
     const systemInstruction = `You are TestIT AI, an autonomous QA browser agent executing an Observe-Plan-Act-Verify loop.
 You are inspecting a live website via Playwright. Based on the current page observation and action history, you must either:
@@ -168,43 +246,95 @@ Return ONLY valid JSON matching this schema:
       credentialsProvided: safeCreds,
     };
 
-    const response = await fetch(endpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [
-          {
-            role: 'user',
-            parts: [
-              {
-                text: `${systemInstruction}\n\n=== OBSERVED STATE AND GOAL ===\n${JSON.stringify(
-                  promptContext,
-                  null,
-                  2
-                )}`,
-              },
-            ],
-          },
-        ],
-        generationConfig: {
-          responseMimeType: 'application/json',
-          temperature: 0.1,
+    try {
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': this.apiKey,
         },
-      }),
-    });
+        body: JSON.stringify({
+          contents: [
+            {
+              role: 'user',
+              parts: [
+                {
+                  text: `${systemInstruction}\n\n=== OBSERVED STATE AND GOAL ===\n${JSON.stringify(
+                    promptContext,
+                    null,
+                    2
+                  )}`,
+                },
+              ],
+            },
+          ],
+          generationConfig: {
+            responseMimeType: 'application/json',
+            temperature: 0.1,
+            maxOutputTokens: this.maxStepTokens,
+          },
+        }),
+        signal: AbortSignal.timeout(this.timeoutMs),
+      });
 
-    if (!response.ok) {
-      const errText = await response.text().catch(() => '');
-      throw new Error(`Gemini API step decision failed (HTTP ${response.status}): ${errText.slice(0, 200)}`);
+      if (!response.ok) {
+        const errText = await response.text().catch(() => '');
+        throw createProviderHttpError({
+          providerName: 'Gemini',
+          status: response.status,
+          rawBody: errText,
+          apiKey: this.apiKey,
+        });
+      }
+
+      const data = await response.json().catch(() => {
+        throw new ProviderError('Gemini API returned an unparseable response payload.', {
+          providerName: 'Gemini',
+          category: 'malformed_response',
+        });
+      });
+
+      const candidate = data?.candidates?.[0];
+      if (!candidate) {
+        throw new ProviderError('Gemini API returned no candidates in response.', {
+          providerName: 'Gemini',
+          category: 'malformed_response',
+        });
+      }
+
+      if (candidate.finishReason === 'MAX_TOKENS') {
+        throw new ProviderError(
+          'Gemini output was truncated due to output token limits (finishReason: MAX_TOKENS).',
+          {
+            providerName: 'Gemini',
+            category: 'malformed_response',
+          }
+        );
+      }
+
+      const rawText = candidate?.content?.parts?.[0]?.text;
+      if (!rawText || !rawText.trim()) {
+        throw new ProviderError('Gemini API returned an empty step decision response.', {
+          providerName: 'Gemini',
+          category: 'malformed_response',
+        });
+      }
+
+      try {
+        return JSON.parse(rawText);
+      } catch {
+        throw new ProviderError('Gemini step decision response could not be parsed as valid JSON.', {
+          providerName: 'Gemini',
+          category: 'malformed_response',
+        });
+      }
+    } catch (err) {
+      if (err instanceof ProviderError) throw err;
+      throw wrapProviderError(err, {
+        providerName: 'Gemini',
+        apiKey: this.apiKey,
+        timeoutMs: this.timeoutMs,
+      });
     }
-
-    const data = await response.json();
-    const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!rawText) {
-      throw new Error('Gemini API returned an empty step decision response.');
-    }
-
-    return JSON.parse(rawText);
   }
 }
-

@@ -2,6 +2,17 @@ import { GeminiProvider } from './geminiProvider.js';
 import { OpenAiProvider } from './openaiProvider.js';
 import { MockProvider } from './mockProvider.js';
 
+export {
+  ProviderError,
+  redactSecrets,
+  classifyProviderError,
+  createProviderHttpError,
+  wrapProviderError,
+  sanitizeErrorString,
+} from './providerSanitizer.js';
+
+export { GeminiProvider, OpenAiProvider, MockProvider };
+
 /**
  * Supported actions for the autonomous agent.
  */
@@ -109,14 +120,16 @@ export function getActiveAiProvider(options = {}) {
   if (process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY.trim()) {
     return new GeminiProvider(
       process.env.GEMINI_API_KEY.trim(),
-      process.env.GEMINI_MODEL || 'gemini-2.5-flash'
+      process.env.GEMINI_MODEL || 'gemini-2.5-flash',
+      options
     );
   }
 
   if (process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY.trim()) {
     return new OpenAiProvider(
       process.env.OPENAI_API_KEY.trim(),
-      process.env.OPENAI_MODEL || 'gpt-4o-mini'
+      process.env.OPENAI_MODEL || 'gpt-4o-mini',
+      options
     );
   }
 
@@ -168,4 +181,3 @@ export function getMissingProviderReport(url, instructions) {
     },
   };
 }
-

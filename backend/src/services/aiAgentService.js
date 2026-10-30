@@ -1,6 +1,11 @@
 import { chromium } from 'playwright';
 import { validateUrl } from '../utils/urlValidator.js';
-import { getActiveAiProvider, getMissingProviderReport, validateAgentDecision } from './aiProvider/index.js';
+import {
+  getActiveAiProvider,
+  getMissingProviderReport,
+  validateAgentDecision,
+  sanitizeErrorString,
+} from './aiProvider/index.js';
 import { observePage } from './pageObserver.js';
 import { verifyDateAndWeekdaySync } from './verifiers/dateVerifier.js';
 
@@ -56,7 +61,19 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
     });
     plannedObjectives = plan.objectives || [];
   } catch (err) {
-    // If objective planning fails, wrap in structured error report
+    // If objective planning fails, wrap in structured error report with sanitized errors
+    const sanitizedError = sanitizeErrorString(err.message, [provider.apiKey]);
+    const hypothesis =
+      err.category === 'authentication_error'
+        ? 'Check that the configured AI provider API key is valid and has appropriate permissions.'
+        : err.category === 'rate_limit_error'
+        ? 'Check API provider rate limits and account quota.'
+        : err.category === 'timeout'
+        ? 'AI provider request timed out. Verify network connectivity and provider availability.'
+        : err.category === 'service_error'
+        ? 'Upstream AI provider is temporarily unavailable. Retry after a moment.'
+        : 'Check API key quotas, network connectivity, or model status.';
+
     return {
       testName: `AI QA Test: ${trimmedInstructions.slice(0, 100)}`,
       startUrl: trimmedUrl,
@@ -69,7 +86,7 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
         provider: provider.name,
         model: provider.model,
         aiConfigured: true,
-        notice: `Planning failed: ${err.message}`,
+        notice: `Planning failed: ${sanitizedError}`,
       },
       missingCredentials: [],
       prohibitedActions: [],
@@ -84,15 +101,15 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
       steps: [],
       failure: {
         description: 'AI model failed during objective planning.',
-        error: err.message,
-        hypothesis: 'Check API key quotas, network connectivity, or model status.',
+        error: sanitizedError,
+        hypothesis,
       },
       coverageAndLimitations: {
         tested: 'None',
         notTested: trimmedInstructions,
         missingPrerequisites: [],
         ambiguousExpectations: null,
-        executionLimitations: err.message,
+        executionLimitations: sanitizedError,
       },
     };
   }
@@ -293,10 +310,20 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
             maxSteps,
           });
         } catch (planErr) {
+          const sanitizedError = sanitizeErrorString(planErr.message, [provider.apiKey]);
+          const hypothesis =
+            planErr.category === 'rate_limit_error'
+              ? 'Rate limit exceeded during step decision.'
+              : planErr.category === 'timeout'
+              ? 'Provider timed out during step decision.'
+              : planErr.category === 'service_error'
+              ? 'Upstream AI service error during step decision.'
+              : 'Model service error, rate limit, or invalid response format.';
+
           objectiveOutcome = 'ERROR';
           objectiveFailure = {
-            description: `AI Provider failed while deciding step ${currentStepIndex}: ${planErr.message}`,
-            hypothesis: 'Model service error, rate limit, or invalid response format.',
+            description: `AI Provider failed while deciding step ${currentStepIndex}: ${sanitizedError}`,
+            hypothesis,
           };
           objectiveFinished = true;
           break;
