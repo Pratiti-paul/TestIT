@@ -296,6 +296,26 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
         }
       }
 
+      // If the browser was left on an authentication barrier by a preceding objective
+      // and this objective is an independent public objective, return to startUrl to allow testing
+      if (
+        page &&
+        !page.isClosed() &&
+        !isLoginVerificationObjective(objective) &&
+        !requiresAuthenticatedSession(objective) &&
+        page.url() !== trimmedUrl
+      ) {
+        const barrier = await detectAuthenticationBarrier(page, null, startOrigin);
+        if (barrier.isBarrier) {
+          try {
+            await page.goto(trimmedUrl, { timeout: stepTimeout, waitUntil: 'domcontentloaded' });
+            await page.waitForTimeout(300);
+          } catch {
+            // ignore navigation errors
+          }
+        }
+      }
+
       // Action loop tracking for loop detection within this objective
       const recentActionSignatures = [];
       let objectiveFinished = false;
@@ -349,6 +369,59 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
           break;
         }
 
+        // Dynamic authentication barrier discovery on non-login objectives
+        if (!isLoginVerificationObjective(objective) && !sessionIsAuthenticated) {
+          const barrier = await detectAuthenticationBarrier(page, observation, startOrigin);
+          if (barrier.isBarrier) {
+            if (credentials?.username && credentials?.password) {
+              const restored = await restoreAuthenticatedSession(
+                page,
+                credentials,
+                currentStepIndex++,
+                objId,
+                executionSteps,
+                stepTimeout,
+                options
+              );
+              if (restored) {
+                sessionIsAuthenticated = true;
+                authSucceeded = true;
+                authFailed = false;
+                try {
+                  observation = await observePage(page, { consoleErrors });
+                } catch {
+                  // ignore observation refresh error
+                }
+              } else {
+                const barrierReason = `Blocked: Authentication prerequisite required (automatic session restoration failed with supplied credentials).`;
+                objectiveOutcome = 'BLOCKED';
+                objectiveFailure = { description: barrierReason };
+                if (!blockedReason) blockedReason = barrierReason;
+                objectiveFinished = true;
+                break;
+              }
+            } else {
+              const barrierReason = `Blocked: Authentication prerequisite required (${barrier.reason}), but no test account credentials were provided.`;
+              executionSteps.push({
+                stepIndex: currentStepIndex++,
+                objectiveId: objId,
+                action: 'blocked',
+                description: `Authentication barrier detected: ${objective.description}`,
+                status: 'BLOCKED',
+                durationMs: 0,
+                expected: objective.expectedOutcome || 'Feature is publicly accessible',
+                actual: barrierReason,
+                screenshot: await captureSafeScreenshot(page),
+              });
+              objectiveOutcome = 'BLOCKED';
+              objectiveFailure = { description: barrierReason };
+              if (!blockedReason) blockedReason = barrierReason;
+              objectiveFinished = true;
+              break;
+            }
+          }
+        }
+
         // Step 2: PLAN / DECIDE NEXT STEP
         let decision;
         try {
@@ -399,7 +472,7 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
         if (decision.action === 'conclude') {
           objectiveFinished = true;
           const conclusion = decision.conclude || {};
-          const concludeStatus =
+          let concludeStatus =
             conclusion.outcome === 'FAIL'
               ? 'FAIL'
               : conclusion.outcome === 'BLOCKED'
@@ -407,6 +480,21 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
               : conclusion.outcome === 'NEEDS_CLARIFICATION'
               ? 'BLOCKED'
               : 'PASS';
+
+          if (concludeStatus === 'FAIL') {
+            if (
+              !isLoginVerificationObjective(objective) &&
+              !sessionIsAuthenticated &&
+              (!credentials?.username || !credentials?.password)
+            ) {
+              const barrier = await detectAuthenticationBarrier(page, observation, startOrigin);
+              if (barrier.isBarrier) {
+                concludeStatus = 'BLOCKED';
+                const barrierReason = `Blocked: Authentication prerequisite required (${barrier.reason}), but no test account credentials were provided.`;
+                conclusion.reasoning = barrierReason;
+              }
+            }
+          }
 
           objectiveOutcome = concludeStatus;
 
@@ -501,6 +589,15 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
           stepStatus = actErr.statusType || 'FAIL';
           stepActual = actErr.message;
           stepScreenshot = await captureSafeScreenshot(page);
+
+          // If the action failed because of an unauthenticated barrier and credentials were not provided, mark as BLOCKED
+          if (!isLoginVerificationObjective(objective) && !sessionIsAuthenticated) {
+            const barrier = await detectAuthenticationBarrier(page, null, startOrigin);
+            if (barrier.isBarrier && (!credentials?.username || !credentials?.password)) {
+              stepStatus = 'BLOCKED';
+              stepActual = `Blocked: Authentication prerequisite required (${barrier.reason}), but no test account credentials were provided.`;
+            }
+          }
 
           objectiveOutcome = stepStatus;
           objectiveFinished = true;
@@ -878,7 +975,8 @@ async function executeAgentAction(page, decision, timeout, context) {
     }
 
     case 'navigate': {
-      const targetUrl = new URL(String(value), context.startOrigin).toString();
+      const rawTarget = value || decision.url;
+      const targetUrl = new URL(String(rawTarget), context.startOrigin).toString();
       if (new URL(targetUrl).origin !== context.startOrigin) {
         const err = new Error(`Cross-origin navigation to "${targetUrl}" is blocked for security.`);
         err.statusType = 'BLOCKED';
@@ -1149,6 +1247,161 @@ export async function restoreAuthenticatedSession(page, credentials, stepIndex, 
     return false;
   } catch {
     return false;
+  }
+}
+
+/**
+ * Dynamically detects whether the current browser page is at an authentication barrier
+ * (e.g., redirected to a login page, displaying an access-denied/auth-required gate,
+ * or presenting a login form on a non-login objective).
+ *
+ * @param {import('playwright').Page} page
+ * @param {object} [observation]
+ * @param {string} [startOrigin]
+ * @returns {Promise<{ isBarrier: boolean, reason?: string, details?: object }>}
+ */
+export async function detectAuthenticationBarrier(page, observation, startOrigin) {
+  if (!page || page.isClosed()) {
+    return { isBarrier: false };
+  }
+
+  try {
+    const currentUrl = page.url();
+    let urlObj;
+    try {
+      urlObj = new URL(currentUrl);
+    } catch {
+      urlObj = null;
+    }
+
+    const pathname = urlObj ? urlObj.pathname.toLowerCase() : '';
+    const search = urlObj ? urlObj.search.toLowerCase() : '';
+
+    // 1. Check URL path for dedicated authentication routes
+    const isAuthRoute =
+      /\/login\b|\/signin\b|\/sign-in\b|\/log-in\b|\/auth\b|\/session\/new\b|\/users\/sign_in\b|\/accounts\/login\b/i.test(
+        pathname
+      );
+
+    // 2. Check for redirect query params indicating a protected destination was intercepted
+    const hasRedirectParam =
+      /[?&](?:redirect|return_to|next|destination|continue|return_url)=/i.test(search);
+
+    // 3. Inspect DOM for visible login inputs, access-denied notices, or login walls
+    const pageSignals = await page
+      .evaluate(() => {
+        const isVisible = (el) => {
+          if (!el) return false;
+          const rect = el.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0;
+        };
+
+        // Password input presence
+        const passInputs = Array.from(document.querySelectorAll('input[type="password"]')).filter(isVisible);
+        const hasVisiblePassword = passInputs.length > 0;
+
+        // Submit or login button
+        const loginButtons = Array.from(
+          document.querySelectorAll('button[type="submit"], input[type="submit"], button, a.btn, [role="button"]')
+        ).filter((el) => {
+          if (!isVisible(el)) return false;
+          const text = (el.innerText || el.textContent || el.value || '').trim().toLowerCase();
+          return /^(?:sign\s*in|log\s*in|login|signin|authenticate)$/i.test(text);
+        });
+        const hasLoginSubmit = loginButtons.length > 0;
+
+        // Access-denied / auth-required text in body or alerts
+        const bodyText = (document.body ? document.body.innerText || '' : '').toLowerCase();
+        const authRequiredPatterns = [
+          /please\s+(?:log\s*in|sign\s*in)\s+(?:to\s+continue|to\s+view|to\s+proceed|to\s+access|to\s+use|first)/i,
+          /you\s+must\s+(?:be\s+logged\s*in|log\s*in|sign\s*in)/i,
+          /authentication\s+(?:required|needed)/i,
+          /login\s+required/i,
+          /sign\s*in\s+required/i,
+          /access\s+denied\s*[:\-–]?\s*(?:please\s+log\s*in|authentication\s+required|401|403)?/i,
+          /401\s+unauthorized/i,
+          /403\s+forbidden/i,
+          /session\s+expired\s*[:\-–]?\s*please\s+(?:log\s*in|sign\s*in)/i,
+        ];
+
+        let detectedAuthText = null;
+        for (const pattern of authRequiredPatterns) {
+          const match = bodyText.match(pattern);
+          if (match) {
+            detectedAuthText = match[0];
+            break;
+          }
+        }
+
+        // Check headings specifically
+        const headings = Array.from(document.querySelectorAll('h1, h2, h3, [role="heading"], .alert, [role="alert"]'))
+          .filter(isVisible)
+          .map((h) => (h.innerText || h.textContent || '').trim());
+
+        const authHeading = headings.find((h) =>
+          /^(?:sign\s*in|log\s*in|login|access\s+denied|authentication\s+required|unauthorized)/i.test(h)
+        );
+
+        return {
+          hasVisiblePassword,
+          hasLoginSubmit,
+          detectedAuthText,
+          authHeading,
+        };
+      })
+      .catch(() => ({
+        hasVisiblePassword: false,
+        hasLoginSubmit: false,
+        detectedAuthText: null,
+        authHeading: null,
+      }));
+
+    // 4. Check observation text / headings as fallback
+    const obsText = `${observation?.title || ''} ${(observation?.headings || []).join(' ')} ${
+      observation?.bodySnippet || ''
+    }`.toLowerCase();
+    const obsHasAuthPhrase =
+      /please\s+(?:log\s*in|sign\s*in)|authentication\s+required|you\s+must\s+be\s+logged\s*in|401\s+unauthorized/i.test(
+        obsText
+      );
+
+    // Evaluate signals
+    if (isAuthRoute || hasRedirectParam) {
+      if (
+        pageSignals.hasVisiblePassword ||
+        pageSignals.hasLoginSubmit ||
+        pageSignals.detectedAuthText ||
+        obsHasAuthPhrase
+      ) {
+        return {
+          isBarrier: true,
+          reason: `Authentication barrier detected: Page navigated or redirected to authentication route (${pathname}) requiring credentials.`,
+          details: { pathname, isAuthRoute, hasRedirectParam, pageSignals },
+        };
+      }
+    }
+
+    if (pageSignals.detectedAuthText || (pageSignals.authHeading && pageSignals.hasVisiblePassword)) {
+      return {
+        isBarrier: true,
+        reason: `Authentication barrier detected: Page displays access restriction "${
+          pageSignals.detectedAuthText || pageSignals.authHeading
+        }".`,
+        details: { pathname, pageSignals },
+      };
+    }
+
+    if (pageSignals.hasVisiblePassword && pageSignals.hasLoginSubmit && pageSignals.authHeading) {
+      return {
+        isBarrier: true,
+        reason: `Authentication barrier detected: Login form presented at "${pathname}".`,
+        details: { pathname, pageSignals },
+      };
+    }
+
+    return { isBarrier: false };
+  } catch {
+    return { isBarrier: false };
   }
 }
 

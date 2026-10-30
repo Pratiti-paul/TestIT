@@ -207,6 +207,49 @@ describe('Autonomous AI QA Agent Suite', () => {
             </body>
           </html>
         `);
+      } else if (url.pathname === '/public-store') {
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end(`
+          <!DOCTYPE html>
+          <html>
+            <head><title>Health Pharmacy Store</title></head>
+            <body>
+              <h1>Health Pharmacy Online</h1>
+              <input id="store-search" placeholder="Search for medicine..." />
+              <button id="search-btn" onclick="doSearch()">Search</button>
+              <div id="results" style="display:none;">
+                <div class="product-item">
+                  <h3>Paracetamol 500mg</h3>
+                  <button id="add-to-cart-btn" onclick="addToCart()">Add to Cart</button>
+                </div>
+              </div>
+              <div id="cart-msg" style="display:none; color:green;">Added to Cart: Paracetamol 500mg</div>
+              <script>
+                function doSearch() {
+                  document.getElementById('results').style.display = 'block';
+                }
+                function addToCart() {
+                  document.getElementById('cart-msg').style.display = 'block';
+                }
+              </script>
+            </body>
+          </html>
+        `);
+      } else if (url.pathname === '/store-with-protected-checkout') {
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end(`
+          <!DOCTYPE html>
+          <html>
+            <head><title>Marketplace Store</title></head>
+            <body>
+              <h1>Marketplace Store</h1>
+              <a href="/login-test-portal?redirect=/protected-checkout" id="checkout-link">Proceed to Checkout</a>
+            </body>
+          </html>
+        `);
+      } else if (url.pathname === '/store-with-protected-orders') {
+        res.writeHead(302, { Location: '/login-test-portal?redirect=/orders' });
+        res.end();
       } else {
         res.writeHead(404);
         res.end('Not Found');
@@ -1686,6 +1729,229 @@ describe('Autonomous AI QA Agent Suite', () => {
       const passStep = report.steps.find((s) => s.action === 'fill' && s.description.includes('password'));
       assert.ok(passStep);
       assert.equal(passStep.actual, 'Filled input with •••••••• (invalid test password)');
+    });
+  });
+
+  describe('6. Autonomous Public Website Testing & Dynamic Access Discovery', () => {
+    it('1. executes public search and cart objective without requiring login credentials', async () => {
+      const mockObjectives = [
+        {
+          id: 'obj-public-cart',
+          description: 'Search for Paracetamol, add the first result to the cart, and verify addition',
+          targetBehavior: 'Search and cart operations on public store',
+        },
+      ];
+
+      // Dependency check must allow running without credentials
+      const checkResult = checkObjectiveDependencies(mockObjectives[0], {
+        failedObjectiveIds: new Set(),
+        authFailed: false,
+        authSucceeded: false,
+        credentials: {},
+      });
+      assert.equal(checkResult.canRun, true, 'Public shopping objective must be runnable without credentials');
+
+      const mockSteps = [
+        {
+          thought: 'Fill search query for Paracetamol',
+          action: 'fill',
+          target: { strategy: 'placeholder', value: 'Search for medicine...' },
+          value: 'Paracetamol',
+        },
+        {
+          thought: 'Click search button',
+          action: 'click',
+          target: { strategy: 'role', value: 'button', name: 'Search' },
+        },
+        {
+          thought: 'Click Add to Cart',
+          action: 'click',
+          target: { strategy: 'role', value: 'button', name: 'Add to Cart' },
+        },
+        {
+          thought: 'Assert item added to cart',
+          action: 'assertVisible',
+          target: { strategy: 'text', value: 'Added to Cart: Paracetamol 500mg' },
+        },
+        {
+          thought: 'Conclude public shopping test',
+          action: 'conclude',
+          conclude: { outcome: 'PASS', reasoning: 'Search and cart verified on public store.' },
+        },
+      ];
+
+      const report = await executeAiAgent(
+        {
+          url: `${baseUrl}/public-store`,
+          instructions: 'Search for Paracetamol and add first result to cart',
+          credentials: {}, // Zero credentials provided
+        },
+        {
+          allowLocalForTesting: true,
+          allowMock: true,
+          mockObjectives,
+          mockSteps,
+        }
+      );
+
+      assert.equal(report.status, 'passed');
+      assert.equal(report.blockedSteps, 0);
+      assert.equal(report.skippedSteps, 0);
+      assert.ok(report.passedSteps >= 4);
+      assert.equal(report.missingCredentials.length, 1);
+    });
+
+    it('2. dynamically discovers that a feature redirects to an authentication barrier and marks it BLOCKED when credentials are unavailable', async () => {
+      const mockObjectives = [
+        {
+          id: 'obj-checkout',
+          description: 'Access shopping cart checkout and proceed',
+          targetBehavior: 'Cart checkout verification',
+        },
+      ];
+
+      // Initially objective is not assumed to be protected
+      const checkResult = checkObjectiveDependencies(mockObjectives[0], {
+        failedObjectiveIds: new Set(),
+        authFailed: false,
+        authSucceeded: false,
+        credentials: {},
+      });
+      assert.equal(checkResult.canRun, true, 'Cart checkout is not assumed protected upfront');
+
+      const mockSteps = [
+        {
+          thought: 'Click proceed to checkout',
+          action: 'click',
+          target: { strategy: 'text', value: 'Proceed to Checkout' },
+        },
+      ];
+
+      const report = await executeAiAgent(
+        {
+          url: `${baseUrl}/store-with-protected-checkout`,
+          instructions: 'Access shopping cart checkout and proceed',
+          credentials: {}, // Zero credentials provided
+        },
+        {
+          allowLocalForTesting: true,
+          allowMock: true,
+          mockObjectives,
+          mockSteps,
+        }
+      );
+
+      assert.equal(report.status, 'blocked');
+      assert.equal(report.blockedSteps, 1);
+      assert.equal(report.failedSteps, 0);
+      assert.equal(report.skippedSteps, 0);
+      const blockedStep = report.steps.find((s) => s.status === 'BLOCKED');
+      assert.ok(blockedStep, 'Step must be recorded as BLOCKED');
+      assert.match(blockedStep.actual, /Authentication prerequisite required|Authentication barrier/i);
+      assert.match(report.blockedReason, /Authentication prerequisite required|Authentication barrier/i);
+    });
+
+    it('3. continues independent public objectives when a protected feature is blocked due to missing credentials', async () => {
+      const mockObjectives = [
+        {
+          id: 'obj-protected-checkout',
+          description: 'Access shopping cart checkout and proceed',
+          targetBehavior: 'Cart checkout verification',
+        },
+        {
+          id: 'obj-independent-calendar',
+          description: 'Check whether the displayed weekday matches the calendar date',
+          targetBehavior: 'Calendar synchronization',
+        },
+      ];
+
+      const report = await executeAiAgent(
+        {
+          url: `${baseUrl}/store-with-protected-checkout`,
+          instructions: 'Test checkout and verify calendar synchronization',
+          credentials: {}, // Zero credentials provided
+        },
+        {
+          allowLocalForTesting: true,
+          allowMock: true,
+          mockObjectives,
+          mockSteps: [
+            // Objective 1 clicks checkout and gets blocked upon encountering auth barrier
+            {
+              thought: 'Click checkout',
+              action: 'click',
+              target: { strategy: 'text', value: 'Proceed to Checkout' },
+            },
+            // Objective 2 starts; navigates to calendar and verifies date sync
+            {
+              thought: 'Navigate to calendar page',
+              action: 'navigate',
+              value: `${baseUrl}/calendar-sync`,
+            },
+            {
+              thought: 'Verify date sync on calendar page',
+              action: 'assertDateSync',
+            },
+            {
+              thought: 'Conclude calendar check',
+              action: 'conclude',
+              conclude: { outcome: 'PASS', reasoning: 'Calendar verified.' },
+            },
+          ],
+        }
+      );
+
+      // Overall status is partial because one was blocked and one passed
+      assert.equal(report.status, 'partial');
+      assert.equal(report.blockedSteps, 1);
+      assert.ok(report.passedSteps >= 1);
+      assert.equal(report.failedSteps, 0);
+
+      const blockedStep = report.steps.find((s) => s.objectiveId === 'obj-protected-checkout' && s.status === 'BLOCKED');
+      assert.ok(blockedStep, 'Protected checkout must be recorded as BLOCKED');
+
+      const passStep = report.steps.find((s) => s.objectiveId === 'obj-independent-calendar' && s.status === 'PASS');
+      assert.ok(passStep, 'Independent calendar check must execute and PASS');
+    });
+
+    it('4. dynamically restores authenticated session using supplied credentials when a protected feature barrier is discovered', async () => {
+      const mockObjectives = [
+        {
+          id: 'obj-protected-orders',
+          description: 'Access member order history',
+          targetBehavior: 'Member orders verification',
+        },
+      ];
+
+      const mockSteps = [
+        {
+          thought: 'Conclude order check',
+          action: 'conclude',
+          conclude: { outcome: 'PASS', reasoning: 'Successfully accessed orders after session restoration.' },
+        },
+      ];
+
+      const report = await executeAiAgent(
+        {
+          url: `${baseUrl}/store-with-protected-orders`,
+          instructions: 'Access member order history',
+          credentials: { username: 'abc@gmail.com', password: 'validpass123' },
+        },
+        {
+          allowLocalForTesting: true,
+          allowMock: true,
+          mockObjectives,
+          mockSteps,
+        }
+      );
+
+      assert.equal(report.status, 'passed');
+      assert.equal(report.blockedSteps, 0);
+      assert.ok(report.passedSteps >= 1);
+      // restoreSession step must be recorded in execution history
+      const restoreStep = report.steps.find((s) => s.action === 'restoreSession');
+      assert.ok(restoreStep, 'restoreSession step must have executed upon discovering barrier');
+      assert.equal(restoreStep.status, 'PASS');
     });
   });
 });
