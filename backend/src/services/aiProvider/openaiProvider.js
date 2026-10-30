@@ -144,8 +144,13 @@ Requirements:
 Based on the live page observation and action history, select the next single Playwright action or conclude.
 Rules:
 - Generic & Prompt-Driven: The user's plain-English instruction dictates what to test. NEVER assume a website follows a specific pre-baked workflow or structure.
+- Ambiguous Controls: If multiple identical controls exist for an action (e.g. multiple "Select", "Delete", or "Add" buttons), compare surrounding cards, rows, or labels. If ambiguity remains without distinguishing context, conclude with "BLOCKED" or "NEEDS_CLARIFICATION". NEVER guess an arbitrary candidate.
+- Real Application State Verification: A button click, modal popup, or toast notification alone does NOT establish PASS. Verify the persistent underlying state (e.g. item present in table, cart count updated, database record listed). If a success toast appears but the list/table/cart remains empty, conclude with "FAIL".
+- Dead Clicks / No-Ops: If an interaction produces no observable DOM mutation, URL change, or status update, do NOT conclude PASS.
+- Empty Results: If a query or search returns "No results found" or 0 items when expecting items, conclude with "FAIL".
 - Observation-Driven Verification: A click or action dispatch alone NEVER establishes PASS. After executing an interaction (e.g. click submit, select option, apply filter, add item, book), you MUST observe the resulting page state and verify that the expected outcome occurred (using "assertVisible", "assertText", or citing specific verified content/evidence in the page snippet) before concluding PASS.
 - If the expected outcome or evidence is not observed on the page after performing an action, conclude with "FAIL" stating what was expected vs what was observed.
+- Adaptive Recovery: If a prior action in history failed with an error, inspect the fresh page observation and try an alternative locator strategy or action rather than repeating the failed action.
 - For invalid login testing: Fill deliberately invalid credentials (e.g. "invalid_user", "wrong_password"), submit, and verify access rejection.
 - For valid login testing: Identify the username/email and password fields to fill. You do not possess the user's secret credentials. For the username/email field, set value to "[VALID_USERNAME]" (or empty string ""). For the password field, set value to "[VALID_PASSWORD]" (or empty string ""). The execution runner injects the exact user-provided credentials directly into the browser. Never generate or rewrite user-provided credentials.
 - If testing both valid and invalid login: Test invalid credentials first, then valid credentials to leave the session authenticated.

@@ -15,6 +15,34 @@ export async function observePage(page, options = {}) {
   const url = page.url();
   const title = (await page.title().catch(() => '')) || '';
 
+  // Bounded check for in-flight spinners/loading skeletons settling before taking observation
+  const isCurrentlyLoading = await page
+    .evaluate(() => {
+      return Boolean(
+        document.querySelector(
+          '[aria-busy="true"], .spinner, [class*="spinner" i], [class*="loading" i], .skeleton, [class*="skeleton" i]'
+        )
+      );
+    })
+    .catch(() => false);
+
+  if (isCurrentlyLoading) {
+    const settleStart = Date.now();
+    while (Date.now() - settleStart < 2500) {
+      await page.waitForTimeout(200);
+      const stillBusy = await page
+        .evaluate(() => {
+          return Boolean(
+            document.querySelector(
+              '[aria-busy="true"], .spinner, [class*="spinner" i], [class*="loading" i], .skeleton, [class*="skeleton" i]'
+            )
+          );
+        })
+        .catch(() => false);
+      if (!stillBusy) break;
+    }
+  }
+
   // Evaluate in-browser structured DOM snapshot safely
   const domData = await page.evaluate(() => {
     // Helper to get element text safely
@@ -77,12 +105,16 @@ export async function observePage(page, options = {}) {
       const disabled = btn.disabled || btn.hasAttribute('disabled') || btn.getAttribute('aria-disabled') === 'true';
       const isSelected = btn.getAttribute('aria-selected') === 'true' || btn.classList.contains('active') || btn.classList.contains('bg-primary');
 
+      const container = btn.closest('tr, article, section, li, [class*="card" i], [class*="row" i], [class*="item" i], form');
+      const containerContext = container ? getText(container).slice(0, 60) : undefined;
+
       interactiveElements.push({
         tag: 'button',
         text: text.slice(0, 40) || ariaLabel || 'button',
         ariaLabel: ariaLabel || undefined,
         disabled: disabled || undefined,
         isSelected: isSelected || undefined,
+        context: containerContext,
       });
     }
 

@@ -360,6 +360,9 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
       let objectiveOutcome = 'PASS';
       let objectiveFailure = null;
       let actionCountInObjective = 0;
+      let actionFailuresInObjective = 0;
+      let deadClicksInObjective = 0;
+      let lastActionWasDeadClick = false;
 
       while (!objectiveFinished && currentStepIndex <= maxSteps) {
         // Fatal browser disconnection check
@@ -550,13 +553,168 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
             }
           }
 
+          // Outcome Verification & Guard against false-positive PASS
+          if (concludeStatus === 'PASS') {
+            // Guard 1: Dead click only
+            if (actionCountInObjective > 0 && deadClicksInObjective === actionCountInObjective) {
+              concludeStatus = 'FAIL';
+              conclusion.reasoning =
+                'Verification failed: Action produced no observable functional change or state update (dead click / no-op).';
+              objectiveFailure = {
+                description: conclusion.reasoning,
+                hypothesis: 'Click on control did not trigger any functional state update.',
+              };
+            }
+
+            // Guard 2: Misleading success notifications
+            if (concludeStatus === 'PASS') {
+              const misleadingState = await page
+                .evaluate(() => {
+                  const toastEl = document.querySelector(
+                    '[role="status"], [role="alert"], .toast, .alert-success, .notification, .Toastify__toast--success'
+                  );
+                  const toastText = toastEl ? (toastEl.innerText || toastEl.textContent || '').trim().toLowerCase() : '';
+                  const hasSuccessToast = /success|added|saved|created|booked|updated|confirmed/i.test(toastText);
+                  if (!hasSuccessToast) return null;
+
+                  const emptyIndicators = Array.from(
+                    document.querySelectorAll(
+                      '.empty-cart, .cart-empty, .no-items, .empty-state, [data-testid="empty-state"]'
+                    )
+                  ).filter((el) => el.offsetWidth > 0 && el.offsetHeight > 0);
+                  const emptyText = emptyIndicators
+                    .map((el) => (el.innerText || el.textContent || '').trim().toLowerCase())
+                    .join(' ');
+                  const isEmptyContainerVisible = /empty|no items|0 items|no bookings|no results/i.test(emptyText);
+
+                  const countBadge = document.querySelector('.cart-count, .item-count, [data-testid="cart-badge"]');
+                  const badgeText = countBadge ? (countBadge.innerText || countBadge.textContent || '').trim() : '';
+                  const isBadgeZero = badgeText === '0' || badgeText === '0 items';
+
+                  const dataTable = document.querySelector(
+                    'table.cart, table.items, table.bookings, [data-testid="items-table"], [data-testid="cart-table"]'
+                  );
+                  const rowCount = dataTable ? dataTable.querySelectorAll('tbody tr').length : null;
+                  const isTableEmpty = rowCount === 0;
+
+                  if (isEmptyContainerVisible || isBadgeZero || isTableEmpty) {
+                    return {
+                      isMisleading: true,
+                      toast: toastText.slice(0, 80),
+                      evidence: isEmptyContainerVisible
+                        ? emptyText.slice(0, 80)
+                        : isBadgeZero
+                        ? 'Badge count is 0'
+                        : 'Table has 0 rows',
+                    };
+                  }
+                  return null;
+                })
+                .catch(() => null);
+
+              if (misleadingState?.isMisleading) {
+                concludeStatus = 'FAIL';
+                conclusion.reasoning = `Verification failed: A success notification ("${misleadingState.toast}") was displayed, but the actual application state is empty (${misleadingState.evidence}). Superficial notification does not reflect persistent state.`;
+                objectiveFailure = {
+                  description: conclusion.reasoning,
+                  hypothesis:
+                    'Application showed a misleading success notification while underlying state was not updated or persisted.',
+                };
+              }
+            }
+
+            // Guard 3: Empty search or listing results
+            if (concludeStatus === 'PASS') {
+              const emptyResultText = await page
+                .evaluate(() => {
+                  const emptyEl = document.querySelector(
+                    '.no-results, .empty-results, [data-testid="no-results"], .alert-info, .empty-state'
+                  );
+                  const text = (
+                    emptyEl
+                      ? emptyEl.innerText || emptyEl.textContent || ''
+                      : document.body
+                      ? document.body.innerText || ''
+                      : ''
+                  ).toLowerCase();
+                  const match = text.match(
+                    /\b(?:no\s*results\s*found|0\s*results\s*found|no\s*matching\s*items|no\s*appointments\s*available|no\s*records\s*found)\b/i
+                  );
+                  return match ? match[0] : null;
+                })
+                .catch(() => null);
+
+              const objCombined = `${objective.targetBehavior || ''} ${objective.description || ''} ${
+                objective.expectedOutcome || ''
+              }`.toLowerCase();
+              const isSearchOrListObj = /\b(search|find|filter|list|records|catalog)\b/i.test(objCombined);
+              const expectsEmpty =
+                /\b(expect.*(?:empty|no\s*results)|verify.*(?:empty|no\s*results)|assert.*(?:empty|no\s*results))\b/i.test(
+                  objCombined
+                );
+
+              if (emptyResultText && isSearchOrListObj && !expectsEmpty) {
+                concludeStatus = 'FAIL';
+                conclusion.reasoning = `Verification failed: Search or listing returned empty results ("${emptyResultText}"). Requested items or records were not found.`;
+                objectiveFailure = {
+                  description: conclusion.reasoning,
+                  hypothesis: 'Search query produced no matching records in the application.',
+                };
+              }
+            }
+
+            // Guard 4: Active form validation errors preventing completion of valid form submission
+            if (concludeStatus === 'PASS') {
+              const objCombined = `${objective.targetBehavior || ''} ${objective.description || ''} ${
+                objective.expectedOutcome || ''
+              }`.toLowerCase();
+              const isSubmitValidObj =
+                /\b(submit|save|create|register|book|valid\s*form)\b/i.test(objCombined) &&
+                !/\b(invalid|reject|denied|validation\s*error|error\s*message)\b/i.test(objCombined);
+
+              if (isSubmitValidObj) {
+                const formValidationError = await page
+                  .evaluate(() => {
+                    const errEls = Array.from(
+                      document.querySelectorAll(
+                        '.error-message, .invalid-feedback, .field-error, [role="alert"].error, input:invalid'
+                      )
+                    ).filter((el) => el.offsetWidth > 0 && el.offsetHeight > 0);
+                    if (errEls.length > 0) {
+                      return (
+                        errEls[0].innerText ||
+                        errEls[0].textContent ||
+                        errEls[0].validationMessage ||
+                        'Form field validation failed'
+                      )
+                        .trim()
+                        .slice(0, 100);
+                    }
+                    return null;
+                  })
+                  .catch(() => null);
+
+                if (formValidationError) {
+                  concludeStatus = 'FAIL';
+                  conclusion.reasoning = `Verification failed: Form has active validation errors preventing submission: "${formValidationError}".`;
+                  objectiveFailure = {
+                    description: conclusion.reasoning,
+                    hypothesis: 'Form submission failed validation constraints.',
+                  };
+                }
+              }
+            }
+          }
+
           objectiveOutcome = concludeStatus;
 
           if (concludeStatus === 'FAIL') {
-            objectiveFailure = conclusion.failureAnalysis || {
-              description: conclusion.reasoning || 'Objective verification failed.',
-              hypothesis: 'Behavior asserted by test objective was not satisfied.',
-            };
+            objectiveFailure =
+              objectiveFailure ||
+              conclusion.failureAnalysis || {
+                description: conclusion.reasoning || 'Objective verification failed.',
+                hypothesis: 'Behavior asserted by test objective was not satisfied.',
+              };
           } else if (concludeStatus === 'BLOCKED') {
             objectiveFailure = { description: conclusion.reasoning };
             if (!blockedReason) blockedReason = conclusion.reasoning;
@@ -616,6 +774,12 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
           if (actResult.screenshot) {
             stepScreenshot = actResult.screenshot;
           }
+          if (actResult.isDeadClick) {
+            deadClicksInObjective++;
+            lastActionWasDeadClick = true;
+          } else {
+            lastActionWasDeadClick = false;
+          }
         } catch (actErr) {
           if (!browser || !browser.isConnected() || (page && page.isClosed())) {
             fatalError = actErr;
@@ -641,9 +805,28 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
             break;
           }
 
-          stepStatus = actErr.statusType || 'FAIL';
-          stepActual = actErr.message;
-          stepScreenshot = await captureSafeScreenshot(page);
+          // Ambiguity Error: Never guess an arbitrary control when multiple match!
+          if (actErr.isAmbiguous) {
+            stepStatus = 'BLOCKED';
+            stepActual = actErr.message;
+            stepScreenshot = await captureSafeScreenshot(page);
+            objectiveOutcome = 'BLOCKED';
+            objectiveFailure = { description: actErr.message };
+            if (!blockedReason) blockedReason = actErr.message;
+            objectiveFinished = true;
+            executionSteps.push({
+              stepIndex: currentStepIndex++,
+              objectiveId: objId,
+              action: decision.action,
+              description: decision.thought || `Execute action: ${decision.action}`,
+              status: stepStatus,
+              durationMs: Date.now() - stepStart,
+              expected: decision.expectedOutcome || `Execute ${decision.action} successfully`,
+              actual: stepActual,
+              screenshot: stepScreenshot,
+            });
+            break;
+          }
 
           // If the action failed because of an unauthenticated barrier or expired session and credentials were not provided, mark as BLOCKED
           if (!isLoginVerificationObjective(objective)) {
@@ -654,9 +837,50 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
                 ? `Blocked: Active session expired (${barrier.reason}), but no valid test credentials were provided to restore it.`
                 : `Blocked: Authentication prerequisite required (${barrier.reason}), but no test account credentials were provided.`;
               sessionIsAuthenticated = false;
+              objectiveOutcome = 'BLOCKED';
+              objectiveFailure = { description: stepActual };
+              if (!blockedReason) blockedReason = stepActual;
+              objectiveFinished = true;
+              executionSteps.push({
+                stepIndex: currentStepIndex++,
+                objectiveId: objId,
+                action: decision.action,
+                description: decision.thought || `Execute action: ${decision.action}`,
+                status: stepStatus,
+                durationMs: Date.now() - stepStart,
+                expected: decision.expectedOutcome || `Execute ${decision.action} successfully`,
+                actual: stepActual,
+                screenshot: stepScreenshot,
+              });
+              break;
             }
           }
 
+          // Adaptive Recovery: Allow up to 1 retry per objective to observe updated state and pick alternative action
+          if (actionFailuresInObjective < 1) {
+            actionFailuresInObjective++;
+            stepStatus = 'FAIL';
+            stepActual = actErr.message;
+            stepScreenshot = await captureSafeScreenshot(page);
+            executionSteps.push({
+              stepIndex: currentStepIndex++,
+              objectiveId: objId,
+              action: decision.action,
+              description: decision.thought || `Execute action: ${decision.action}`,
+              status: stepStatus,
+              isRecovered: true,
+              durationMs: Date.now() - stepStart,
+              expected: decision.expectedOutcome || `Execute ${decision.action} successfully`,
+              actual: `${stepActual} (Adaptive recovery: Page state refreshed to adapt strategy)`,
+              screenshot: stepScreenshot,
+            });
+            console.log(`[Adaptive Recovery]: Action "${decision.action}" failed: ${actErr.message}. Refreshing page state.`);
+            continue;
+          }
+
+          stepStatus = actErr.statusType || 'FAIL';
+          stepActual = actErr.message;
+          stepScreenshot = await captureSafeScreenshot(page);
           objectiveOutcome = stepStatus;
           objectiveFinished = true;
 
@@ -665,7 +889,7 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
               description: `Verification failed at step ${currentStepIndex}: ${actErr.message}`,
               expected: decision.expectedOutcome || decision.action,
               actual: actErr.message,
-              hypothesis: 'The application did not exhibit the expected functional behavior.',
+              hypothesis: 'The application did not exhibit the expected functional behavior after locator resolution and retry.',
             };
           } else if (stepStatus === 'BLOCKED') {
             objectiveFailure = { description: actErr.message };
@@ -676,6 +900,19 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
               hypothesis: 'Timeout or network disconnection.',
             };
           }
+
+          executionSteps.push({
+            stepIndex: currentStepIndex++,
+            objectiveId: objId,
+            action: decision.action,
+            description: decision.thought || `Execute action: ${decision.action}`,
+            status: stepStatus,
+            durationMs: Date.now() - stepStart,
+            expected: decision.expectedOutcome || `Execute ${decision.action} successfully`,
+            actual: stepActual,
+            screenshot: stepScreenshot,
+          });
+          break;
         }
 
         const stepDuration = Date.now() - stepStart;
@@ -855,7 +1092,7 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
   // 6. Tally metrics
   const totalSteps = executionSteps.length;
   const passedSteps = executionSteps.filter((s) => s.status === 'PASS').length;
-  const failedSteps = executionSteps.filter((s) => s.status === 'FAIL').length;
+  const failedSteps = executionSteps.filter((s) => s.status === 'FAIL' && !s.isRecovered).length;
   const blockedSteps = executionSteps.filter((s) => s.status === 'BLOCKED').length;
   const errorSteps = executionSteps.filter((s) => s.status === 'ERROR').length;
   const skippedSteps = executionSteps.filter((s) => s.status === 'SKIPPED').length;
@@ -865,7 +1102,7 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
 
   if (fatalError) {
     finalStatus = 'error';
-  } else if (allOutcomes.includes('FAIL') || executionSteps.some((s) => s.status === 'FAIL')) {
+  } else if (allOutcomes.includes('FAIL') || executionSteps.some((s) => s.status === 'FAIL' && !s.isRecovered)) {
     finalStatus = 'failed';
   } else if (allOutcomes.includes('ERROR') || executionSteps.some((s) => s.status === 'ERROR')) {
     finalStatus = 'error';
@@ -950,12 +1187,23 @@ async function executeAgentAction(page, decision, timeout, context) {
 
   switch (action) {
     case 'click': {
-      const locator = await resolveAgentLocator(page, target, timeout, decision);
+      const locator = await resolveAgentLocator(page, target, timeout, decision, context);
       const targetStr = `${target?.strategy || ''} ${target?.value || ''} ${target?.name || ''}`.toLowerCase();
       const preClickUrl = page.url();
 
       let isEnabled = await locator.isEnabled({ timeout: Math.min(timeout, 2000) }).catch(() => true);
-      if (!isEnabled) {
+      const isDisabledAttr = await locator
+        .evaluate((el) => {
+          return (
+            el.disabled === true ||
+            el.hasAttribute('disabled') ||
+            el.getAttribute('aria-disabled') === 'true' ||
+            el.classList.contains('disabled')
+          );
+        })
+        .catch(() => false);
+
+      if (!isEnabled || isDisabledAttr) {
         // If the control is currently disabled, check whether a previous submission/request is actively pending
         const loadingInfo = await page
           .evaluate(() => {
@@ -1005,6 +1253,17 @@ async function executeAgentAction(page, decision, timeout, context) {
         err.statusType = 'BLOCKED';
         throw err;
       }
+
+      // Pre-click snapshot for dead-click detection
+      const preClickSnapshot = await page
+        .evaluate(() => {
+          return {
+            textLength: (document.body?.innerText || '').length,
+            domCount: document.querySelectorAll('*').length,
+            tableRows: document.querySelectorAll('tr, li, [role="row"]').length,
+          };
+        })
+        .catch(() => null);
 
       await locator.click({ timeout });
       await page.waitForTimeout(400);
@@ -1103,32 +1362,51 @@ async function executeAgentAction(page, decision, timeout, context) {
       }
 
       const postClickUrl = page.url();
-      let clickActual = `Click dispatched successfully on "${target.value || target.name || 'control'}"`;
-      if (postClickUrl !== preClickUrl) {
-        clickActual = `Clicked "${target.value || target.name || 'control'}" and navigated to "${postClickUrl}"`;
-      } else {
-        const postState = await page
-          .evaluate(() => {
-            const el = document.querySelector(
-              '[role="status"], [role="alert"], .alert, .modal, .toast, .confirmation, [aria-live="polite"], .booking-confirmation, .order-confirmation'
-            );
-            if (el && el.offsetWidth > 0 && el.offsetHeight > 0) {
-              return (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 100);
-            }
-            return null;
-          })
-          .catch(() => null);
+      const postClickSnapshot = await page
+        .evaluate(() => {
+          const el = document.querySelector(
+            '[role="status"], [role="alert"], .alert, .modal, .toast, .confirmation, [aria-live="polite"], .booking-confirmation, .order-confirmation'
+          );
+          const notification =
+            el && el.offsetWidth > 0 && el.offsetHeight > 0
+              ? (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 100)
+              : null;
 
-        if (postState) {
-          clickActual = `Clicked "${target.value || target.name || 'control'}". Observed update: "${postState}"`;
-        }
+          return {
+            textLength: (document.body?.innerText || '').length,
+            domCount: document.querySelectorAll('*').length,
+            tableRows: document.querySelectorAll('tr, li, [role="row"]').length,
+            notification,
+          };
+        })
+        .catch(() => null);
+
+      const isUrlChanged = postClickUrl !== preClickUrl;
+      const isNotificationShown = Boolean(postClickSnapshot?.notification);
+      const isDomChanged =
+        !preClickSnapshot ||
+        !postClickSnapshot ||
+        Math.abs(postClickSnapshot.textLength - preClickSnapshot.textLength) > 0 ||
+        postClickSnapshot.domCount !== preClickSnapshot.domCount ||
+        postClickSnapshot.tableRows !== preClickSnapshot.tableRows;
+
+      let clickActual = `Click dispatched successfully on "${target.value || target.name || 'control'}"`;
+      let isDeadClick = false;
+
+      if (isUrlChanged) {
+        clickActual = `Clicked "${target.value || target.name || 'control'}" and navigated to "${postClickUrl}"`;
+      } else if (isNotificationShown) {
+        clickActual = `Clicked "${target.value || target.name || 'control'}". Observed update: "${postClickSnapshot.notification}"`;
+      } else if (!isDomChanged) {
+        isDeadClick = true;
+        clickActual = `Click dispatched on "${target.value || target.name || 'control'}" but produced no observable functional change (no-op/dead click).`;
       }
 
-      return { actual: clickActual };
+      return { actual: clickActual, isDeadClick };
     }
 
     case 'fill': {
-      const locator = await resolveAgentLocator(page, target, timeout, decision);
+      const locator = await resolveAgentLocator(page, target, timeout, decision, context);
 
       // Domain-agnostic field attribute & type discovery via target descriptors and DOM element attributes
       const targetStr = `${target?.strategy || ''} ${target?.value || ''} ${target?.name || ''}`.toLowerCase();
@@ -1252,7 +1530,7 @@ async function executeAgentAction(page, decision, timeout, context) {
     }
 
     case 'select': {
-      const locator = await resolveAgentLocator(page, target, timeout, decision);
+      const locator = await resolveAgentLocator(page, target, timeout, decision, context);
       await locator.selectOption(String(value), { timeout });
       return { actual: `Selected option "${value}"` };
     }
@@ -1287,7 +1565,7 @@ async function executeAgentAction(page, decision, timeout, context) {
     }
 
     case 'assertVisible': {
-      const locator = await resolveAgentLocator(page, target, timeout, decision);
+      const locator = await resolveAgentLocator(page, target, timeout, decision, context);
       const isVisible = await locator.isVisible().catch(() => false);
       if (!isVisible) {
         const err = new Error(`Element matching "${target.value}" is not visible on page.`);
@@ -1298,7 +1576,7 @@ async function executeAgentAction(page, decision, timeout, context) {
     }
 
     case 'assertText': {
-      const locator = await resolveAgentLocator(page, target, timeout, decision);
+      const locator = await resolveAgentLocator(page, target, timeout, decision, context);
       const text = ((await locator.textContent({ timeout })) || '').trim();
       const expected = String(value);
       const matched = decision.exact
@@ -1337,11 +1615,107 @@ async function executeAgentAction(page, decision, timeout, context) {
  * Resolves a locator using accessible roles, labels, text, or CSS with
  * generic discovery and multi-tier recovery when primary matching fails.
  */
-async function resolveAgentLocator(page, target, timeout, decision = null) {
+async function resolveAgentLocator(page, target, timeout, decision = null, context = null) {
   if (!target) throw new Error('Action decision missing target specification.');
   const { strategy, value, name } = target;
 
   const escapeRegex = (str) => String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+  // Disambiguation helper for multiple visible matching candidates
+  const disambiguateCandidates = async (candidateLocators, label, strat) => {
+    if (candidateLocators.length === 1) {
+      return candidateLocators[0];
+    }
+    if (candidateLocators.length === 0) {
+      return null;
+    }
+
+    // Multiple visible candidate controls exist.
+    // Collect context clues from decision and objective
+    const contextClues = [
+      decision?.thought,
+      decision?.expectedOutcome,
+      decision?.target?.context,
+      context?.objective?.targetBehavior,
+      context?.objective?.description,
+      context?.objective?.expectedOutcome,
+    ]
+      .filter(Boolean)
+      .join(' ')
+      .toLowerCase();
+
+    const stopWords = new Set([
+      'the', 'and', 'for', 'with', 'that', 'this', 'from', 'click', 'button', 'select', 'test', 'verify',
+      'page', 'should', 'will', 'have', 'been', 'user', 'action', 'element', 'control', 'role', 'text'
+    ]);
+    const keywords = contextClues
+      .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+      .split(/\s+/)
+      .filter((w) => w.length >= 3 && !stopWords.has(w));
+
+    const scored = [];
+    for (let i = 0; i < candidateLocators.length; i++) {
+      const loc = candidateLocators[i];
+      const containerInfo = await loc
+        .evaluate((el) => {
+          const container = el.closest(
+            'tr, article, section, li, [class*="card" i], [class*="row" i], [class*="item" i], form, fieldset, div'
+          );
+          if (!container) return '';
+          return (container.innerText || container.textContent || '').trim().replace(/\s+/g, ' ').toLowerCase();
+        })
+        .catch(() => '');
+
+      let score = 0;
+      if (keywords.length > 0 && containerInfo.length > 0) {
+        for (const kw of keywords) {
+          if (containerInfo.includes(kw)) {
+            score++;
+          }
+        }
+      }
+      scored.push({ loc, score, snippet: containerInfo.slice(0, 80) });
+    }
+
+    scored.sort((a, b) => b.score - a.score);
+
+    // If the top scored candidate has a distinct higher score > 0 than the second one:
+    if (scored[0].score > 0 && (scored.length === 1 || scored[0].score > scored[1].score)) {
+      console.log(
+        `[Locator Disambiguation]: Disambiguated "${label}" (score ${scored[0].score}) via container: "${scored[0].snippet}"`
+      );
+      return scored[0].loc;
+    }
+
+    // True ambiguity remains: multiple visible identical candidates cannot be uniquely disambiguated
+    const ambigErr = new Error(
+      `Ambiguous controls: Found ${candidateLocators.length} identical visible controls matching "${label}" (strategy: ${strat}). Cannot determine intended target without additional context.`
+    );
+    ambigErr.isAmbiguous = true;
+    ambigErr.statusType = 'BLOCKED';
+    throw ambigErr;
+  };
+
+  const checkAndDisambiguate = async (loc, label, strat) => {
+    const cnt = await loc.count().catch(() => 0);
+    if (cnt === 1) {
+      if (await loc.first().isVisible({ timeout: 800 }).catch(() => false)) {
+        return loc.first();
+      }
+    } else if (cnt > 1) {
+      const vis = [];
+      for (let i = 0; i < cnt; i++) {
+        const nth = loc.nth(i);
+        if (await nth.isVisible({ timeout: 400 }).catch(() => false)) {
+          vis.push(nth);
+        }
+      }
+      if (vis.length > 0) {
+        return await disambiguateCandidates(vis, label, strat);
+      }
+    }
+    return null;
+  };
 
   // Helper to build primary locator
   const buildPrimaryLocator = (strat, val, nm) => {
@@ -1370,11 +1744,26 @@ async function resolveAgentLocator(page, target, timeout, decision = null) {
   // 1. Primary fast attempt (up to 2500ms or remaining timeout)
   const primaryWaitMs = Math.min(timeout, 2500);
   try {
-    const isPrimaryVis = await primaryLocator.first().isVisible({ timeout: primaryWaitMs }).catch(() => false);
-    if (isPrimaryVis) {
-      return primaryLocator.first();
+    const matchCount = await primaryLocator.count().catch(() => 0);
+    if (matchCount === 1) {
+      const isPrimaryVis = await primaryLocator.first().isVisible({ timeout: primaryWaitMs }).catch(() => false);
+      if (isPrimaryVis) {
+        return primaryLocator.first();
+      }
+    } else if (matchCount > 1) {
+      const visibleCandidates = [];
+      for (let i = 0; i < matchCount; i++) {
+        const item = primaryLocator.nth(i);
+        if (await item.isVisible({ timeout: 400 }).catch(() => false)) {
+          visibleCandidates.push(item);
+        }
+      }
+      if (visibleCandidates.length > 0) {
+        return await disambiguateCandidates(visibleCandidates, name || value, strategy);
+      }
     }
-  } catch {
+  } catch (err) {
+    if (err.isAmbiguous) throw err;
     // Proceed to generic recovery
   }
 
@@ -1390,18 +1779,20 @@ async function resolveAgentLocator(page, target, timeout, decision = null) {
     for (const kw of candidateKeywords) {
       // Try regex name match on the same role
       const regexRole = page.getByRole(value, { name: new RegExp(escapeRegex(kw), 'i') });
-      if (await regexRole.first().isVisible({ timeout: 800 }).catch(() => false)) {
+      const recRole = await checkAndDisambiguate(regexRole, kw, value);
+      if (recRole) {
         console.log(`[Locator Recovery]: Recovered element with role "${value}" matching "${kw}".`);
-        return regexRole.first();
+        return recRole;
       }
 
       // Cross-role discovery (e.g. model guessed link but element is button, or vice-versa)
       const altRoles = value === 'link' ? ['button', 'tab'] : value === 'button' ? ['link', 'tab'] : ['button', 'link'];
       for (const altRole of altRoles) {
         const altRoleLoc = page.getByRole(altRole, { name: new RegExp(escapeRegex(kw), 'i') });
-        if (await altRoleLoc.first().isVisible({ timeout: 800 }).catch(() => false)) {
+        const recAlt = await checkAndDisambiguate(altRoleLoc, kw, altRole);
+        if (recAlt) {
           console.log(`[Locator Recovery]: Recovered cross-role element with role "${altRole}" matching "${kw}".`);
-          return altRoleLoc.first();
+          return recAlt;
         }
       }
 
@@ -1409,9 +1800,10 @@ async function resolveAgentLocator(page, target, timeout, decision = null) {
       const interactiveMatch = page
         .locator('button, a, input[type="button"], input[type="submit"], [role="button"], [role="link"], [role="tab"]')
         .filter({ hasText: new RegExp(escapeRegex(kw), 'i') });
-      if (await interactiveMatch.first().isVisible({ timeout: 800 }).catch(() => false)) {
+      const recInt = await checkAndDisambiguate(interactiveMatch, kw, 'interactive');
+      if (recInt) {
         console.log(`[Locator Recovery]: Recovered interactive element with text matching "${kw}".`);
-        return interactiveMatch.first();
+        return recInt;
       }
     }
   }
@@ -1419,23 +1811,26 @@ async function resolveAgentLocator(page, target, timeout, decision = null) {
   // 2B. Text-based recovery
   if (strategy === 'text' && value) {
     const textRegex = page.getByText(new RegExp(escapeRegex(cleanLabel || value), 'i'));
-    if (await textRegex.first().isVisible({ timeout: 800 }).catch(() => false)) {
+    const recText = await checkAndDisambiguate(textRegex, cleanLabel || value, 'text');
+    if (recText) {
       console.log(`[Locator Recovery]: Recovered text element via case-insensitive matching: "${cleanLabel || value}".`);
-      return textRegex.first();
+      return recText;
     }
 
     const textSubLoc = page
       .locator('button, a, input[type="button"], input[type="submit"], [role="button"], [role="link"], [role="tab"]')
       .filter({ hasText: new RegExp(escapeRegex(cleanLabel || value), 'i') });
-    if (await textSubLoc.first().isVisible({ timeout: 800 }).catch(() => false)) {
+    const recSub = await checkAndDisambiguate(textSubLoc, cleanLabel || value, 'interactive-text');
+    if (recSub) {
       console.log(`[Locator Recovery]: Recovered text element via interactive substring matching: "${cleanLabel || value}".`);
-      return textSubLoc.first();
+      return recSub;
     }
 
     const ariaMatch = page.locator(`[aria-label*="${cleanLabel || value}" i], [title*="${cleanLabel || value}" i]`);
-    if (await ariaMatch.first().isVisible({ timeout: 800 }).catch(() => false)) {
+    const recAria = await checkAndDisambiguate(ariaMatch, cleanLabel || value, 'aria-label');
+    if (recAria) {
       console.log(`[Locator Recovery]: Recovered text element via aria-label/title: "${cleanLabel || value}".`);
-      return ariaMatch.first();
+      return recAria;
     }
   }
 
@@ -1447,9 +1842,10 @@ async function resolveAgentLocator(page, target, timeout, decision = null) {
       const cssRecovered = page
         .locator('button, a, [role="button"], [role="link"]')
         .filter({ hasText: new RegExp(escapeRegex(extractedText), 'i') });
-      if (await cssRecovered.first().isVisible({ timeout: 800 }).catch(() => false)) {
+      const recCss = await checkAndDisambiguate(cssRecovered, extractedText, 'css');
+      if (recCss) {
         console.log(`[Locator Recovery]: Recovered CSS element via extracted text query "${extractedText}".`);
-        return cssRecovered.first();
+        return recCss;
       }
     }
   }

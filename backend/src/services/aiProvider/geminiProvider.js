@@ -17,7 +17,7 @@ import {
 } from './providerSanitizer.js';
 
 export class GeminiProvider {
-  constructor(apiKey, model = 'gemini-2.5-flash', options = {}) {
+  constructor(apiKey, model = 'gemini-3.5-flash-lite', options = {}) {
     this.apiKey = apiKey;
     this.model = model;
     this.name = 'gemini';
@@ -77,25 +77,35 @@ Requirements:
 User Instructions: "${instructions}"
 Test Credentials Available: ${credentials?.username ? 'Yes (Username/Password provided)' : 'None'}`;
 
-    try {
-      let response;
-      const planPayload = {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-goog-api-key': this.apiKey,
+    const planPayload = {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': this.apiKey,
+      },
+      body: JSON.stringify({
+        contents: [{ role: 'user', parts: [{ text: `${systemInstruction}\n\n${userPrompt}` }] }],
+        generationConfig: {
+          responseMimeType: 'application/json',
+          temperature: 0.1,
+          maxOutputTokens: this.maxPlanningTokens,
         },
-        body: JSON.stringify({
-          contents: [{ role: 'user', parts: [{ text: `${systemInstruction}\n\n${userPrompt}` }] }],
-          generationConfig: {
-            responseMimeType: 'application/json',
-            temperature: 0.1,
-            maxOutputTokens: this.maxPlanningTokens,
-          },
-        }),
-      };
+      }),
+    };
 
-      const maxRetries = 3;
+    try {
+      const candidateModels = [this.model, 'gemini-3.5-flash-lite', 'gemini-3.5-flash', 'gemini-3-flash-preview'].filter(
+        (m, idx, arr) => m && arr.indexOf(m) === idx
+      );
+
+    let lastHttpError = null;
+
+    for (let mIdx = 0; mIdx < candidateModels.length; mIdx++) {
+      const activeModel = candidateModels[mIdx];
+      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${activeModel}:generateContent`;
+
+      let response;
+      const maxRetries = 2;
       for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
           response = await fetch(endpoint, {
@@ -104,81 +114,96 @@ Test Credentials Available: ${credentials?.username ? 'Yes (Username/Password pr
           });
         } catch (firstErr) {
           if (attempt === maxRetries) throw firstErr;
-          await new Promise((r) => setTimeout(r, 1200 * attempt));
+          await new Promise((r) => setTimeout(r, 1000 * attempt));
           continue;
         }
 
         if ((response.status === 429 || response.status === 503) && attempt < maxRetries) {
           const retryAfterSec = parseInt(response.headers?.get?.('retry-after') || '0', 10);
-          const waitMs = retryAfterSec > 0 ? retryAfterSec * 1000 : 2000 * attempt;
+          const waitMs = retryAfterSec > 0 ? retryAfterSec * 1000 : 1500 * attempt;
           await new Promise((r) => setTimeout(r, waitMs));
           continue;
         }
         break;
       }
 
-      if (!response.ok) {
-        const errText = await response.text().catch(() => '');
-        throw createProviderHttpError({
-          providerName: 'Gemini',
-          status: response.status,
-          rawBody: errText,
-          apiKey: this.apiKey,
-        });
-      }
+      if (response && response.ok) {
+        if (activeModel !== this.model) {
+          console.log(`[Gemini Failover]: Switched to operational model "${activeModel}" after "${this.model}" returned unavailable.`);
+          this.model = activeModel;
+        }
 
-      const data = await response.json().catch(() => {
-        throw new ProviderError('Gemini API returned an unparseable response payload.', {
-          providerName: 'Gemini',
-          category: 'malformed_response',
-        });
-      });
-
-      const candidate = data?.candidates?.[0];
-      if (!candidate) {
-        throw new ProviderError('Gemini API returned no candidates in response.', {
-          providerName: 'Gemini',
-          category: 'malformed_response',
-        });
-      }
-
-      if (candidate.finishReason === 'MAX_TOKENS') {
-        throw new ProviderError(
-          'Gemini output was truncated due to output token limits (finishReason: MAX_TOKENS).',
-          {
+        const data = await response.json().catch(() => {
+          throw new ProviderError('Gemini API returned an unparseable response payload.', {
             providerName: 'Gemini',
             category: 'malformed_response',
-          }
-        );
-      }
-
-      const rawJson = candidate?.content?.parts?.[0]?.text;
-      if (!rawJson || !rawJson.trim()) {
-        throw new ProviderError('Gemini API returned an empty response during test objective planning.', {
-          providerName: 'Gemini',
-          category: 'malformed_response',
+          });
         });
+
+        const candidate = data?.candidates?.[0];
+        if (!candidate) {
+          throw new ProviderError('Gemini API returned no candidates in response.', {
+            providerName: 'Gemini',
+            category: 'malformed_response',
+          });
+        }
+
+        if (candidate.finishReason === 'MAX_TOKENS') {
+          throw new ProviderError(
+            'Gemini output was truncated due to output token limits (finishReason: MAX_TOKENS).',
+            {
+              providerName: 'Gemini',
+              category: 'malformed_response',
+            }
+          );
+        }
+
+        const rawJson = candidate?.content?.parts?.[0]?.text;
+        if (!rawJson || !rawJson.trim()) {
+          throw new ProviderError('Gemini API returned an empty response during test objective planning.', {
+            providerName: 'Gemini',
+            category: 'malformed_response',
+          });
+        }
+
+        let parsed;
+        try {
+          parsed = JSON.parse(rawJson);
+        } catch {
+          throw new ProviderError('Gemini response could not be parsed as valid JSON.', {
+            providerName: 'Gemini',
+            category: 'malformed_response',
+          });
+        }
+
+        if (!Array.isArray(parsed.objectives) || parsed.objectives.length === 0) {
+          throw new ProviderError('Gemini response did not contain an array of test objectives.', {
+            providerName: 'Gemini',
+            category: 'malformed_response',
+          });
+        }
+
+        return parsed;
       }
 
-      let parsed;
-      try {
-        parsed = JSON.parse(rawJson);
-      } catch {
-        throw new ProviderError('Gemini response could not be parsed as valid JSON.', {
-          providerName: 'Gemini',
-          category: 'malformed_response',
-        });
+      const errText = await response.text().catch(() => '');
+      lastHttpError = createProviderHttpError({
+        providerName: 'Gemini',
+        status: response.status,
+        rawBody: errText,
+        apiKey: this.apiKey,
+      });
+
+      if ((response.status === 503 || response.status === 404) && mIdx < candidateModels.length - 1) {
+        console.log(`[Gemini Provider]: Model "${activeModel}" returned HTTP ${response.status}. Trying fallback model "${candidateModels[mIdx + 1]}".`);
+        continue;
       }
 
-      if (!Array.isArray(parsed.objectives) || parsed.objectives.length === 0) {
-        throw new ProviderError('Gemini response did not contain an array of test objectives.', {
-          providerName: 'Gemini',
-          category: 'malformed_response',
-        });
-      }
+      throw lastHttpError;
+    }
 
-      return parsed;
-    } catch (err) {
+    if (lastHttpError) throw lastHttpError;
+  } catch (err) {
       if (err instanceof ProviderError) throw err;
       throw wrapProviderError(err, {
         providerName: 'Gemini',
@@ -231,8 +256,13 @@ Available Actions:
 Decision Rules:
 - Prioritize accessible roles, labels, and text over raw CSS classes.
 - Generic & Prompt-Driven: The user's plain-English instruction dictates what to test. NEVER assume a website follows a specific pre-baked workflow or structure.
+- Ambiguous Controls: If multiple identical controls exist for an action (e.g. multiple "Select", "Delete", or "Add" buttons), compare surrounding cards, rows, or labels. If ambiguity remains without distinguishing context, conclude with "BLOCKED" or "NEEDS_CLARIFICATION". NEVER guess an arbitrary candidate.
+- Real Application State Verification: A button click, modal popup, or toast notification alone does NOT establish PASS. Verify the persistent underlying state (e.g. item present in table, cart count updated, database record listed). If a success toast appears but the list/table/cart remains empty, conclude with "FAIL".
+- Dead Clicks / No-Ops: If an interaction produces no observable DOM mutation, URL change, or status update, do NOT conclude PASS.
+- Empty Results: If a query or search returns "No results found" or 0 items when expecting items, conclude with "FAIL".
 - Observation-Driven Verification: A click or action dispatch alone NEVER establishes PASS. After executing an interaction (e.g. click submit, select option, apply filter, add item, book), you MUST observe the resulting page state and verify that the expected outcome occurred (using "assertVisible", "assertText", or citing specific verified content/evidence in the page snippet) before concluding PASS.
 - If the expected outcome or evidence is not observed on the page after performing an action, conclude with "FAIL" stating what was expected vs what was observed.
+- Adaptive Recovery: If a prior action in history failed with an error, inspect the fresh page observation and try an alternative locator strategy or action rather than repeating the failed action.
 - If the objective requires verifying date/day synchronization and the page displays a calendar or day ribbon, choose "assertDateSync".
 - If testing invalid login: Fill username and password with deliberately invalid values (e.g., "invalid_user", "wrong_password"), submit, and verify that access is denied (error message, alert, or remaining on login page).
 - When testing valid login: Identify the username/email and password fields to fill. You do not possess the user's secret credentials. For the username/email field, set value to "[VALID_USERNAME]" (or leave blank ""). For the password field, set value to "[VALID_PASSWORD]" (or leave blank ""). The test runner injects the exact user-provided credentials directly into the browser. Never generate or rewrite user-provided credentials.
@@ -291,38 +321,48 @@ Return ONLY valid JSON matching this schema:
       credentialsProvided: safeCreds,
     };
 
-    try {
-      let response;
-      const fetchPayload = {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-goog-api-key': this.apiKey,
-        },
-        body: JSON.stringify({
-          contents: [
-            {
-              role: 'user',
-              parts: [
-                {
-                  text: `${systemInstruction}\n\n=== OBSERVED STATE AND GOAL ===\n${JSON.stringify(
-                    promptContext,
-                    null,
-                    2
-                  )}`,
-                },
-              ],
-            },
-          ],
-          generationConfig: {
-            responseMimeType: 'application/json',
-            temperature: 0.1,
-            maxOutputTokens: this.maxStepTokens,
+    const fetchPayload = {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': this.apiKey,
+      },
+      body: JSON.stringify({
+        contents: [
+          {
+            role: 'user',
+            parts: [
+              {
+                text: `${systemInstruction}\n\n=== OBSERVED STATE AND GOAL ===\n${JSON.stringify(
+                  promptContext,
+                  null,
+                  2
+                )}`,
+              },
+            ],
           },
-        }),
-      };
+        ],
+        generationConfig: {
+          responseMimeType: 'application/json',
+          temperature: 0.1,
+          maxOutputTokens: this.maxStepTokens,
+        },
+      }),
+    };
 
-      const maxRetries = 3;
+    try {
+      const candidateModels = [this.model, 'gemini-3.5-flash-lite', 'gemini-3.5-flash', 'gemini-3-flash-preview'].filter(
+        (m, idx, arr) => m && arr.indexOf(m) === idx
+      );
+
+    let lastHttpError = null;
+
+    for (let mIdx = 0; mIdx < candidateModels.length; mIdx++) {
+      const activeModel = candidateModels[mIdx];
+      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${activeModel}:generateContent`;
+
+      let response;
+      const maxRetries = 2;
       for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
           response = await fetch(endpoint, {
@@ -331,70 +371,90 @@ Return ONLY valid JSON matching this schema:
           });
         } catch (firstErr) {
           if (attempt === maxRetries) throw firstErr;
-          await new Promise((r) => setTimeout(r, 1200 * attempt));
+          await new Promise((r) => setTimeout(r, 1000 * attempt));
           continue;
         }
 
         if ((response.status === 429 || response.status === 503) && attempt < maxRetries) {
           const retryAfterSec = parseInt(response.headers?.get?.('retry-after') || '0', 10);
-          const waitMs = retryAfterSec > 0 ? retryAfterSec * 1000 : 2500 * attempt;
+          const waitMs = retryAfterSec > 0 ? retryAfterSec * 1000 : 1500 * attempt;
           await new Promise((r) => setTimeout(r, waitMs));
           continue;
         }
         break;
       }
 
-      if (!response.ok) {
-        const errText = await response.text().catch(() => '');
-        throw createProviderHttpError({
-          providerName: 'Gemini',
-          status: response.status,
-          rawBody: errText,
-          apiKey: this.apiKey,
-        });
-      }
+      if (response && response.ok) {
+        if (activeModel !== this.model) {
+          console.log(`[Gemini Failover]: Switched to operational model "${activeModel}" after "${this.model}" returned unavailable.`);
+          this.model = activeModel;
+        }
 
-      const data = await response.json().catch(() => {
-        throw new ProviderError('Gemini API returned an unparseable response payload.', {
-          providerName: 'Gemini',
-          category: 'malformed_response',
-        });
-      });
-
-      const candidate = data?.candidates?.[0];
-      if (!candidate) {
-        throw new ProviderError('Gemini API returned no candidates in response.', {
-          providerName: 'Gemini',
-          category: 'malformed_response',
-        });
-      }
-
-      if (candidate.finishReason === 'MAX_TOKENS') {
-        throw new ProviderError(
-          'Gemini output was truncated due to output token limits (finishReason: MAX_TOKENS).',
-          {
+        const data = await response.json().catch(() => {
+          throw new ProviderError('Gemini API returned an unparseable response payload.', {
             providerName: 'Gemini',
             category: 'malformed_response',
+          });
+        });
+
+        const candidate = data?.candidates?.[0];
+        if (!candidate) {
+          throw new ProviderError('Gemini API returned no candidates in response.', {
+            providerName: 'Gemini',
+            category: 'malformed_response',
+          });
+        }
+
+        if (candidate.finishReason === 'MAX_TOKENS') {
+          throw new ProviderError(
+            'Gemini output was truncated due to output token limits (finishReason: MAX_TOKENS).',
+            {
+              providerName: 'Gemini',
+              category: 'malformed_response',
+            }
+          );
+        }
+
+        const rawText = candidate?.content?.parts?.[0]?.text;
+        if (!rawText || !rawText.trim()) {
+          throw new ProviderError('Gemini API returned an empty step decision response.', {
+            providerName: 'Gemini',
+            category: 'malformed_response',
+          });
+        }
+
+        try {
+          return JSON.parse(rawText);
+        } catch {
+          const cleaned = rawText.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
+          try {
+            return JSON.parse(cleaned);
+          } catch (jsonErr) {
+            throw new ProviderError(`Gemini step decision response could not be parsed as valid JSON: ${jsonErr.message}`, {
+              providerName: 'Gemini',
+              category: 'malformed_response',
+            });
           }
-        );
+        }
       }
 
-      const rawText = candidate?.content?.parts?.[0]?.text;
-      if (!rawText || !rawText.trim()) {
-        throw new ProviderError('Gemini API returned an empty step decision response.', {
-          providerName: 'Gemini',
-          category: 'malformed_response',
-        });
+      const errText = await response.text().catch(() => '');
+      lastHttpError = createProviderHttpError({
+        providerName: 'Gemini',
+        status: response.status,
+        rawBody: errText,
+        apiKey: this.apiKey,
+      });
+
+      if ((response.status === 503 || response.status === 404) && mIdx < candidateModels.length - 1) {
+        console.log(`[Gemini Provider]: Model "${activeModel}" returned HTTP ${response.status}. Trying fallback model "${candidateModels[mIdx + 1]}".`);
+        continue;
       }
 
-      try {
-        return JSON.parse(rawText);
-      } catch {
-        throw new ProviderError('Gemini step decision response could not be parsed as valid JSON.', {
-          providerName: 'Gemini',
-          category: 'malformed_response',
-        });
-      }
+      throw lastHttpError;
+    }
+
+    if (lastHttpError) throw lastHttpError;
     } catch (err) {
       if (err instanceof ProviderError) throw err;
       throw wrapProviderError(err, {

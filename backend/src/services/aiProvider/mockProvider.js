@@ -60,10 +60,32 @@ export class MockProvider {
       if (step) return step;
     }
 
-    if (Array.isArray(this.customSteps) && this.customSteps.length > 0 && this.stepIndex < this.customSteps.length) {
-      const step = this.customSteps[this.stepIndex++];
-      const resolved = typeof step === 'function' ? step({ objective, observation, history, stepNumber, maxSteps }) : step;
-      if (resolved) return resolved;
+    if (Array.isArray(this.customSteps) && this.customSteps.length > 0) {
+      if (this.stepIndex < this.customSteps.length) {
+        const step = this.customSteps[this.stepIndex++];
+        const resolved = typeof step === 'function' ? step({ objective, observation, history, stepNumber, maxSteps }) : step;
+        if (resolved) return resolved;
+      } else {
+        const lastStep = history[history.length - 1];
+        if (lastStep?.status === 'FAIL') {
+          return {
+            thought: `Custom step sequence failed at step: ${lastStep.actual || ''}`,
+            action: 'conclude',
+            conclude: {
+              outcome: 'FAIL',
+              reasoning: lastStep.actual || 'Previous action failed.',
+            },
+          };
+        }
+        return {
+          thought: 'Custom step sequence completed',
+          action: 'conclude',
+          conclude: {
+            outcome: 'PASS',
+            reasoning: 'Custom step sequence completed.',
+          },
+        };
+      }
     }
 
     // Default heuristic for mock when no custom sequence is provided
