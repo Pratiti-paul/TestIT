@@ -3,6 +3,12 @@
  * Interacts with Google Generative Language REST API.
  */
 
+import dns from 'node:dns';
+
+try {
+  dns.setDefaultResultOrder('ipv4first');
+} catch {}
+
 import {
   ProviderError,
   createProviderHttpError,
@@ -17,7 +23,7 @@ export class GeminiProvider {
     this.name = 'gemini';
     this.timeoutMs =
       options.timeoutMs ||
-      (process.env.AI_PROVIDER_TIMEOUT_MS ? parseInt(process.env.AI_PROVIDER_TIMEOUT_MS, 10) : 15000);
+      (process.env.AI_PROVIDER_TIMEOUT_MS ? parseInt(process.env.AI_PROVIDER_TIMEOUT_MS, 10) : 30000);
     this.maxPlanningTokens = options.maxPlanningTokens || 1024;
     this.maxStepTokens = options.maxStepTokens || 800;
   }
@@ -72,7 +78,8 @@ User Instructions: "${instructions}"
 Test Credentials Available: ${credentials?.username ? 'Yes (Username/Password provided)' : 'None'}`;
 
     try {
-      const response = await fetch(endpoint, {
+      let response;
+      const planPayload = {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -86,8 +93,21 @@ Test Credentials Available: ${credentials?.username ? 'Yes (Username/Password pr
             maxOutputTokens: this.maxPlanningTokens,
           },
         }),
-        signal: AbortSignal.timeout(this.timeoutMs),
-      });
+      };
+
+      try {
+        response = await fetch(endpoint, {
+          ...planPayload,
+          signal: AbortSignal.timeout(this.timeoutMs),
+        });
+      } catch (firstErr) {
+        // Retry once on transient network hiccup or timeout
+        await new Promise((r) => setTimeout(r, 1200));
+        response = await fetch(endpoint, {
+          ...planPayload,
+          signal: AbortSignal.timeout(this.timeoutMs),
+        });
+      }
 
       if (!response.ok) {
         const errText = await response.text().catch(() => '');
@@ -262,7 +282,8 @@ Return ONLY valid JSON matching this schema:
     };
 
     try {
-      const response = await fetch(endpoint, {
+      let response;
+      const fetchPayload = {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -289,8 +310,21 @@ Return ONLY valid JSON matching this schema:
             maxOutputTokens: this.maxStepTokens,
           },
         }),
-        signal: AbortSignal.timeout(this.timeoutMs),
-      });
+      };
+
+      try {
+        response = await fetch(endpoint, {
+          ...fetchPayload,
+          signal: AbortSignal.timeout(this.timeoutMs),
+        });
+      } catch (firstErr) {
+        // Retry once on transient network hiccup or timeout
+        await new Promise((r) => setTimeout(r, 1200));
+        response = await fetch(endpoint, {
+          ...fetchPayload,
+          signal: AbortSignal.timeout(this.timeoutMs),
+        });
+      }
 
       if (!response.ok) {
         const errText = await response.text().catch(() => '');

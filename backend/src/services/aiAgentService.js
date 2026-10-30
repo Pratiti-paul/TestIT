@@ -981,8 +981,32 @@ async function executeAgentAction(page, decision, timeout, context) {
             sawLoadingState = true;
           }
 
-          // If navigation away happened, or token stored, or error message appeared:
-          if (page.url() !== preClickUrl || settleState.hasToken || settleState.hasError) {
+          // If navigation away happened:
+          if (page.url() !== preClickUrl) {
+            break;
+          }
+
+          // If auth token was stored, wait for SPA navigation away from login
+          if (settleState.hasToken) {
+            await page
+              .waitForURL(
+                (u) => {
+                  try {
+                    return new URL(u).pathname !== new URL(preClickUrl).pathname;
+                  } catch {
+                    return u !== preClickUrl;
+                  }
+                },
+                { timeout: 3500 }
+              )
+              .catch(() => {});
+            await page.waitForTimeout(400);
+            break;
+          }
+
+          // If an error alert appeared:
+          if (settleState.hasError) {
+            await page.waitForTimeout(300);
             break;
           }
 
@@ -1203,9 +1227,22 @@ async function resolveAgentLocator(page, target, timeout) {
     case 'placeholder':
       locator = page.getByPlaceholder(value);
       break;
-    case 'text':
-      locator = page.getByText(value);
+    case 'text': {
+      // Prioritize interactive controls (buttons, links, inputs) matching exact text
+      const escaped = String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const interactiveExact = page
+        .locator('button, a, input[type="submit"], input[type="button"], [role="button"]')
+        .filter({ hasText: new RegExp(`^${escaped}$`, 'i') });
+      const count = await interactiveExact.count().catch(() => 0);
+      if (count > 0) {
+        locator = interactiveExact;
+      } else {
+        const exact = page.getByText(value, { exact: true });
+        const exactCount = await exact.count().catch(() => 0);
+        locator = exactCount > 0 ? exact : page.getByText(value);
+      }
       break;
+    }
     case 'css':
     default:
       locator = page.locator(value);
