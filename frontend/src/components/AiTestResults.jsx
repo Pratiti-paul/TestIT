@@ -15,14 +15,21 @@ import {
   SkipForward,
   HelpCircle,
 } from 'lucide-react';
+import {
+  resolveStatusBanner,
+  resolvePlannerAttribution,
+  resolveFailureDetails,
+  resolveStepDetails,
+} from '../utils/aiTestResultsPresenter.js';
 
 /**
  * AiTestResults
  *
  * Renders the complete AI test report:
- * - Overall status banner (PASSED / FAILED / PARTIAL / BLOCKED / UNSUPPORTED)
- * - AI Planner metadata & clear deterministic fallback indicator
+ * - Overall status banner (PASSED / FAILED / PARTIAL / BLOCKED / UNSUPPORTED / ERROR)
+ * - AI Planner metadata & clear deterministic fallback / mock indicator
  * - Blocked / Prerequisite requirements banner
+ * - Structured failure details (description, hypothesis, expected vs actual)
  * - Metrics summary cards and live page diagnostics
  * - Step-by-step execution timeline with expected vs actual outcomes
  * - Clear status badges: PASS, FAIL, BLOCKED, ERROR, SKIPPED
@@ -32,15 +39,29 @@ export function AiTestResults({ report }) {
   const [expandedScreenshots, setExpandedScreenshots] = useState({});
   const [modalImage, setModalImage] = useState(null);
 
-  if (!report) return null;
+  if (!report || typeof report !== 'object') return null;
 
-  const isPassed = report.status === 'passed' || report.status === 'PASS';
-  const isBlocked = report.status === 'blocked' || report.status === 'BLOCKED';
-  const isPartial = report.status === 'partial' || report.status === 'PARTIAL';
-  const isUnsupported = report.status === 'unsupported';
-  const isFailed = report.status === 'failed' || report.status === 'FAIL' || report.status === 'error';
+  const {
+    isPassed,
+    isBlocked,
+    isPartial,
+    isUnsupported,
+    isError,
+    isFailed,
+    hasFailedOrError,
+    statusTitle,
+    statusSubtitle,
+    durationSec,
+  } = resolveStatusBanner(report);
 
-  const durationSec = ((report.durationMs || 0) / 1000).toFixed(2);
+  const {
+    isLiveAi,
+    plannerTitle,
+    plannerBadge,
+    notice: plannerNotice,
+  } = resolvePlannerAttribution(report.planner);
+
+  const failureDetails = resolveFailureDetails(report.failure, isError);
 
   const toggleScreenshot = (stepIndex) => {
     setExpandedScreenshots((prev) => ({
@@ -71,6 +92,7 @@ export function AiTestResults({ report }) {
           <div className="status-icon-wrapper">
             {isPassed && <CheckCircle2 size={38} className="icon-passed" aria-hidden="true" />}
             {isFailed && <XCircle size={38} className="icon-failed" aria-hidden="true" />}
+            {isError && <AlertTriangle size={38} className="icon-failed" aria-hidden="true" />}
             {isPartial && <AlertTriangle size={38} className="icon-partial" aria-hidden="true" />}
             {isBlocked && <ShieldAlert size={38} className="icon-blocked" aria-hidden="true" />}
             {isUnsupported && <HelpCircle size={38} className="icon-blocked" aria-hidden="true" />}
@@ -78,15 +100,9 @@ export function AiTestResults({ report }) {
           <div className="status-text-content">
             <span className="status-label-eyebrow">AI QA Test Outcome</span>
             <h2 id="ai-results-heading" className="status-title">
-              {isPassed && 'Test Passed Successfully'}
-              {isFailed && 'Test Verification Failed'}
-              {isPartial && 'Partial Test Journey Completed'}
-              {isBlocked && 'Test Execution Blocked'}
-              {isUnsupported && 'Clarification / AI Key Required'}
+              {statusTitle}
             </h2>
-            <p className="status-subtitle">
-              {report.objective || report.testName || 'AI Website Test'}
-            </p>
+            <p className="status-subtitle">{statusSubtitle}</p>
           </div>
         </div>
 
@@ -106,21 +122,15 @@ export function AiTestResults({ report }) {
       {report.planner && (
         <div
           className={`planner-attribution-card ${
-            report.planner.aiConfigured ? 'planner-ai-live' : 'planner-fallback-active'
+            isLiveAi ? 'planner-ai-live' : 'planner-fallback-active'
           }`}
         >
           <div className="planner-card-header">
             <Cpu size={18} aria-hidden="true" />
-            <strong>
-              {report.planner.aiConfigured
-                ? `AI Planner: ${report.planner.provider?.toUpperCase()} (${report.planner.model || 'live'})`
-                : 'Deterministic Fallback Planner'}
-            </strong>
-            <span className="planner-badge">
-              {report.planner.aiConfigured ? 'LLM Synthesized' : 'Rule-Based Engine'}
-            </span>
+            <strong>{plannerTitle}</strong>
+            <span className="planner-badge">{plannerBadge}</span>
           </div>
-          <p className="planner-notice-text">{report.planner.notice}</p>
+          {plannerNotice && <p className="planner-notice-text">{plannerNotice}</p>}
         </div>
       )}
 
@@ -142,17 +152,45 @@ export function AiTestResults({ report }) {
       )}
 
       {/* 4. Failure Detail Box */}
-      {isFailed && report.failure && (
+      {hasFailedOrError && failureDetails && (
         <div className="failure-alert-box" role="alert">
           <div className="failure-box-header">
             <AlertTriangle size={20} className="icon-alert" aria-hidden="true" />
-            <h3>
-              {report.failure.status === 'ERROR'
-                ? `Technical Error at Step ${report.failure.stepIndex} (${report.failure.action})`
-                : `Verification Failed at Step ${report.failure.stepIndex} (${report.failure.action})`}
-            </h3>
+            <h3>{failureDetails.failureHeading}</h3>
           </div>
-          <p className="failure-message">{report.failure.message}</p>
+
+          {failureDetails.primaryMessage && (
+            <p className="failure-message">{failureDetails.primaryMessage}</p>
+          )}
+
+          {failureDetails.hypothesis && (
+            <div className="failure-hypothesis">
+              <strong>Hypothesis:</strong> {failureDetails.hypothesis}
+            </div>
+          )}
+
+          {(failureDetails.hasExpected || failureDetails.hasActual) && (
+            <div
+              className="step-outcomes-grid"
+              style={{
+                gridTemplateColumns:
+                  failureDetails.hasExpected && failureDetails.hasActual ? '1fr 1fr' : '1fr',
+              }}
+            >
+              {failureDetails.hasExpected && (
+                <div className="outcome-block expected-block">
+                  <span className="outcome-label">Expected:</span>
+                  <p className="outcome-text">{failureDetails.expected}</p>
+                </div>
+              )}
+              {failureDetails.hasActual && (
+                <div className="outcome-block actual-block actual-failed">
+                  <span className="outcome-label">Actual:</span>
+                  <p className="outcome-text">{failureDetails.actual}</p>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       )}
 
@@ -195,12 +233,12 @@ export function AiTestResults({ report }) {
         <div className="metric-card">
           <span className="metric-label">Page Status</span>
           <strong className="metric-value">
-            {report.pageDiagnostics?.httpStatus || (isBlocked ? 'N/A' : 200)}
+            {report.pageDiagnostics?.httpStatus || (isBlocked || isError || isUnsupported ? 'N/A' : 200)}
           </strong>
           <span className="metric-caption">
-            {report.pageDiagnostics?.loadTimeMs
+            {report.pageDiagnostics?.loadTimeMs !== undefined && report.pageDiagnostics?.loadTimeMs !== null
               ? `${report.pageDiagnostics.loadTimeMs}ms load time`
-              : 'HTTP Response'}
+              : (report.pageDiagnostics?.httpStatus ? 'HTTP Response' : 'N/A')}
           </span>
         </div>
       </div>
@@ -217,42 +255,21 @@ export function AiTestResults({ report }) {
 
           <div className="step-cards-list">
             {report.steps.map((step) => {
-              const normStatus = (step.status || '').toUpperCase();
-              const isPass = normStatus === 'PASS' || normStatus === 'PASSED';
-              const isFail = normStatus === 'FAIL' || normStatus === 'FAILED';
-              const isBlock = normStatus === 'BLOCKED';
-              const isErr = normStatus === 'ERROR';
-              const isSkip = normStatus === 'SKIPPED';
-
-              const cardClass = isPass
-                ? 'card-passed'
-                : isFail
-                ? 'card-failed'
-                : isBlock
-                ? 'card-blocked'
-                : isErr
-                ? 'card-error'
-                : 'card-skipped';
-
-              const pillClass = isPass
-                ? 'pill-passed'
-                : isFail
-                ? 'pill-failed'
-                : isBlock
-                ? 'pill-blocked'
-                : isErr
-                ? 'pill-error'
-                : 'pill-skipped';
-
-              const actualBlockClass = isPass
-                ? 'actual-passed'
-                : isFail
-                ? 'actual-failed'
-                : isBlock
-                ? 'actual-blocked'
-                : isErr
-                ? 'actual-failed'
-                : 'actual-skipped';
+              const {
+                normStatus,
+                isPass,
+                isFail,
+                isBlock,
+                isErr,
+                isSkip,
+                cardClass,
+                pillClass,
+                actualBlockClass,
+                hasExpected,
+                hasActual,
+                expected,
+                actual,
+              } = resolveStepDetails(step);
 
               const hasScreenshot = Boolean(step.screenshot);
               const isExpanded = Boolean(expandedScreenshots[step.stepIndex]);
@@ -311,17 +328,28 @@ export function AiTestResults({ report }) {
                     </div>
                   </div>
 
-                  <div className="step-outcomes-grid">
-                    <div className="outcome-block expected-block">
-                      <span className="outcome-label">Expected:</span>
-                      <p className="outcome-text">{step.expected}</p>
-                    </div>
+                  {(hasExpected || hasActual) && (
+                    <div
+                      className="step-outcomes-grid"
+                      style={{
+                        gridTemplateColumns: hasExpected && hasActual ? '1fr 1fr' : '1fr',
+                      }}
+                    >
+                      {hasExpected && (
+                        <div className="outcome-block expected-block">
+                          <span className="outcome-label">Expected:</span>
+                          <p className="outcome-text">{expected}</p>
+                        </div>
+                      )}
 
-                    <div className={`outcome-block actual-block ${actualBlockClass}`}>
-                      <span className="outcome-label">Actual:</span>
-                      <p className="outcome-text">{step.actual}</p>
+                      {hasActual && (
+                        <div className={`outcome-block actual-block ${actualBlockClass}`}>
+                          <span className="outcome-label">Actual:</span>
+                          <p className="outcome-text">{actual}</p>
+                        </div>
+                      )}
                     </div>
-                  </div>
+                  )}
 
                   {hasScreenshot && (
                     <div className="step-screenshot-section">

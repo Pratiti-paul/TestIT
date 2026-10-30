@@ -1308,6 +1308,21 @@
   border-radius: 8px;
 }
 
+.failure-hypothesis {
+  font-size: 13px;
+  color: var(--text-muted);
+  line-height: 1.5;
+  background: rgba(0, 0, 0, 0.03);
+  border-left: 3px solid var(--critical);
+  padding: 8px 12px;
+  border-radius: 4px;
+  margin: 0;
+}
+
+.failure-hypothesis strong {
+  color: var(--text-h);
+}
+
 /* Step-by-Step Results */
 .steps-results-container {
   display: flex;
