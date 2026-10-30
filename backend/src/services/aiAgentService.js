@@ -2,6 +2,7 @@ import { chromium } from 'playwright';
 import { validateUrl } from '../utils/urlValidator.js';
 import {
   getActiveAiProvider,
+  getAiProviderBundle,
   getMissingProviderReport,
   validateAgentDecision,
   sanitizeErrorString,
@@ -45,77 +46,125 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
     throw new Error(`Security validation rejected target URL: ${initialUrlCheck.error}`);
   }
 
-  // 2. Resolve AI Provider
-  const provider = getActiveAiProvider(options);
-  if (!provider) {
+  // 2. Resolve AI Provider Bundle (primary and optional fallback)
+  const providerBundle = getAiProviderBundle(options);
+  let activeProvider = providerBundle.primaryProvider;
+  const fallbackProvider = providerBundle.fallbackProvider;
+
+  if (!activeProvider) {
     // Return explicit configuration requirement rather than pretending or rejecting
     return getMissingProviderReport(trimmedUrl, trimmedInstructions);
   }
 
-  // 3. Plan test objectives using AI provider
-  let plannedObjectives = [];
-  try {
-    const plan = await provider.planObjectives({
-      url: trimmedUrl,
-      instructions: trimmedInstructions,
-      credentials,
-    });
-    plannedObjectives = plan.objectives || [];
-  } catch (err) {
-    // If objective planning fails, wrap in structured error report with sanitized errors
-    const sanitizedError = sanitizeErrorString(
-      err.message,
-      [provider.apiKey, credentials?.password, credentials?.username].filter(Boolean)
-    );
-    const hypothesis =
-      err.category === 'authentication_error'
-        ? 'Check that the configured AI provider API key is valid and has appropriate permissions.'
-        : err.category === 'rate_limit_error'
-        ? 'Check API provider rate limits and account quota.'
-        : err.category === 'timeout'
-        ? 'AI provider request timed out. Verify network connectivity and provider availability.'
-        : err.category === 'service_error'
-        ? 'Upstream AI provider is temporarily unavailable. Retry after a moment.'
-        : 'Check API key quotas, network connectivity, or model status.';
+  let providerSwitched = false;
+  let providerSwitchDetails = null;
+  let executionHaltedByProvider = false;
+  let providerHaltReason = null;
 
-    return {
-      testName: `AI QA Test: ${trimmedInstructions.slice(0, 100)}`,
-      startUrl: trimmedUrl,
-      finalUrl: trimmedUrl,
-      status: 'error',
-      blockedReason: null,
-      objective: trimmedInstructions,
-      planner: {
-        mode: 'llm_agent',
-        provider: provider.name,
-        model: provider.model,
-        aiConfigured: true,
-        notice: `Planning failed: ${sanitizedError}`,
-      },
-      missingCredentials: [],
-      prohibitedActions: [],
-      durationMs: Date.now() - startTime,
-      totalSteps: 0,
-      executedSteps: 0,
-      passedSteps: 0,
-      failedSteps: 0,
-      blockedSteps: 0,
-      errorSteps: 1,
-      skippedSteps: 0,
-      steps: [],
-      failure: {
-        description: 'AI model failed during objective planning.',
-        error: sanitizedError,
-        hypothesis,
-      },
-      coverageAndLimitations: {
-        tested: 'None',
-        notTested: trimmedInstructions,
-        missingPrerequisites: [],
-        ambiguousExpectations: null,
-        executionLimitations: sanitizedError,
-      },
-    };
+  // 3. Plan test objectives using AI provider (avoid redundant call if pre-planned)
+  let plannedObjectives = [];
+  if (Array.isArray(options.mockObjectives) && options.mockObjectives.length > 0) {
+    plannedObjectives = options.mockObjectives;
+  } else if (Array.isArray(options.plannedObjectives) && options.plannedObjectives.length > 0) {
+    plannedObjectives = options.plannedObjectives;
+  } else {
+    try {
+      const plan = await activeProvider.planObjectives({
+        url: trimmedUrl,
+        instructions: trimmedInstructions,
+        credentials,
+      });
+      plannedObjectives = plan.objectives || [];
+    } catch (err) {
+      // If primary provider fails and fallback is available, attempt fallback planning
+      if (fallbackProvider && activeProvider !== fallbackProvider) {
+        const switchReason = sanitizeErrorString(
+          err.message,
+          [activeProvider.apiKey, credentials?.password, credentials?.username].filter(Boolean)
+        );
+        console.log(
+          `[AI Provider Fallback]: Primary provider "${activeProvider.name}" failed during planning: ${switchReason}. Falling back to "${fallbackProvider.name}".`
+        );
+        activeProvider = fallbackProvider;
+        providerSwitched = true;
+        providerSwitchDetails = {
+          from: providerBundle.primaryProvider.name,
+          to: fallbackProvider.name,
+          reason: switchReason,
+          phase: 'planning',
+        };
+        try {
+          const plan = await activeProvider.planObjectives({
+            url: trimmedUrl,
+            instructions: trimmedInstructions,
+            credentials,
+          });
+          plannedObjectives = plan.objectives || [];
+        } catch (fallbackErr) {
+          err = fallbackErr;
+        }
+      }
+
+      if (!plannedObjectives || plannedObjectives.length === 0) {
+        // If objective planning fails, wrap in structured error report with sanitized errors
+        const sanitizedError = sanitizeErrorString(
+          err.message,
+          [activeProvider.apiKey, credentials?.password, credentials?.username].filter(Boolean)
+        );
+        const hypothesis =
+          err.category === 'authentication_error'
+            ? 'Check that the configured AI provider API key is valid and has appropriate permissions.'
+            : err.category === 'quota_exhausted_error'
+            ? 'Check API provider account quota or billing limits.'
+            : err.category === 'rate_limit_error'
+            ? 'Check API provider rate limits and account quota.'
+            : err.category === 'timeout'
+            ? 'AI provider request timed out. Verify network connectivity and provider availability.'
+            : err.category === 'service_error'
+            ? 'Upstream AI provider is temporarily unavailable. Retry after a moment.'
+            : 'Check API key quotas, network connectivity, or model status.';
+
+        return {
+          testName: `AI QA Test: ${trimmedInstructions.slice(0, 100)}`,
+          startUrl: trimmedUrl,
+          finalUrl: trimmedUrl,
+          status: 'error',
+          blockedReason: null,
+          objective: trimmedInstructions,
+          planner: {
+            mode: 'llm_agent',
+            provider: activeProvider.name,
+            model: activeProvider.model,
+            aiConfigured: true,
+            fallbackUsed: providerSwitchDetails,
+            notice: `Planning failed: ${sanitizedError}`,
+          },
+          missingCredentials: [],
+          prohibitedActions: [],
+          durationMs: Date.now() - startTime,
+          totalSteps: 0,
+          executedSteps: 0,
+          passedSteps: 0,
+          failedSteps: 0,
+          blockedSteps: 0,
+          errorSteps: 1,
+          skippedSteps: 0,
+          steps: [],
+          failure: {
+            description: 'AI model failed during objective planning.',
+            error: sanitizedError,
+            hypothesis,
+          },
+          coverageAndLimitations: {
+            tested: 'None',
+            notTested: trimmedInstructions,
+            missingPrerequisites: [],
+            ambiguousExpectations: null,
+            executionLimitations: sanitizedError,
+          },
+        };
+      }
+    }
   }
 
   // 4. Launch isolated Chromium browser
@@ -480,7 +529,7 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
         // Step 2: PLAN / DECIDE NEXT STEP
         let decision;
         try {
-          decision = await provider.decideNextStep({
+          decision = await activeProvider.decideNextStep({
             objective,
             observation,
             history: executionSteps,
@@ -489,26 +538,77 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
             maxSteps,
           });
         } catch (planErr) {
-          const sanitizedError = sanitizeErrorString(
-            planErr.message,
-            [provider.apiKey, credentials?.password, credentials?.username].filter(Boolean)
-          );
-          const hypothesis =
-            planErr.category === 'rate_limit_error'
-              ? 'Rate limit exceeded during step decision.'
-              : planErr.category === 'timeout'
-              ? 'Provider timed out during step decision.'
-              : planErr.category === 'service_error'
-              ? 'Upstream AI service error during step decision.'
-              : 'Model service error, rate limit, or invalid response format.';
+          // Check if a safe, explicitly configured fallback provider is available
+          if (fallbackProvider && activeProvider !== fallbackProvider) {
+            const switchReason = sanitizeErrorString(
+              planErr.message,
+              [activeProvider.apiKey, credentials?.password, credentials?.username].filter(Boolean)
+            );
+            console.log(
+              `[AI Provider Fallback]: Primary provider "${activeProvider.name}" failed at step ${currentStepIndex}: ${switchReason}. Failing over to "${fallbackProvider.name}".`
+            );
+            activeProvider = fallbackProvider;
+            providerSwitched = true;
+            providerSwitchDetails = {
+              from: providerBundle.primaryProvider.name,
+              to: fallbackProvider.name,
+              reason: switchReason,
+              stepIndex: currentStepIndex,
+            };
+            // Pass the CURRENT observation and execution history to fallback provider without replaying completed actions
+            try {
+              decision = await activeProvider.decideNextStep({
+                objective,
+                observation,
+                history: executionSteps,
+                credentials,
+                stepNumber: currentStepIndex,
+                maxSteps,
+              });
+            } catch (fallbackErr) {
+              planErr = fallbackErr; // Fallback also failed
+            }
+          }
 
-          objectiveOutcome = 'ERROR';
-          objectiveFailure = {
-            description: `AI Provider failed while deciding step ${currentStepIndex}: ${sanitizedError}`,
-            hypothesis,
-          };
-          objectiveFinished = true;
-          break;
+          if (!decision) {
+            const sanitizedError = sanitizeErrorString(
+              planErr.message,
+              [activeProvider.apiKey, credentials?.password, credentials?.username].filter(Boolean)
+            );
+            const hypothesis =
+              planErr.category === 'quota_exhausted_error'
+                ? 'AI provider quota exhausted. Check your plan usage or billing.'
+                : planErr.category === 'rate_limit_error'
+                ? 'Rate limit exceeded during step decision.'
+                : planErr.category === 'timeout'
+                ? 'Provider timed out during step decision.'
+                : planErr.category === 'service_error'
+                ? 'Upstream AI service error during step decision.'
+                : 'Model service error, rate limit, or quota exhaustion.';
+
+            const stepScreenshot = await captureSafeScreenshot(page);
+            executionSteps.push({
+              stepIndex: currentStepIndex++,
+              objectiveId: objId,
+              action: 'error',
+              description: `AI Provider failed while deciding step ${currentStepIndex}`,
+              status: 'ERROR',
+              durationMs: 0,
+              expected: 'AI provider generates next action',
+              actual: `Execution halted: AI provider failed: ${sanitizedError}`,
+              screenshot: stepScreenshot,
+            });
+
+            objectiveOutcome = 'ERROR';
+            objectiveFailure = {
+              description: `AI Provider failed while deciding step ${currentStepIndex}: ${sanitizedError}`,
+              hypothesis,
+            };
+            objectiveFinished = true;
+            executionHaltedByProvider = true;
+            providerHaltReason = sanitizedError;
+            break;
+          }
         }
 
         // Validate decision schema & attempt safe bounded repair
@@ -876,8 +976,9 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
             }
           }
 
-          // Adaptive Recovery: Allow up to 1 retry per objective to observe updated state and pick alternative action
-          if (actionFailuresInObjective < 1) {
+          // Adaptive Recovery: Allow up to 1 retry per objective to observe updated state and pick alternative action (interactions only)
+          const isAssertion = decision.action === 'assertVisible' || decision.action === 'assertText' || decision.action === 'assertDateSync';
+          if (!isAssertion && actionFailuresInObjective < 1) {
             actionFailuresInObjective++;
             stepStatus = 'FAIL';
             stepActual = actErr.message;
@@ -1032,7 +1133,7 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
             authFailed = false;
           }
         } else {
-          if (testsValid) {
+          if (objective.isAuthGate === true || testsValid) {
             authFailed = true;
             authSucceeded = false;
             sessionIsAuthenticated = false;
@@ -1044,11 +1145,17 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
         }
       }
 
-      // If fatal error occurred, abort remaining objectives and record them as SKIPPED
-      if (fatalError) {
+      // If fatal error occurred or provider halted mid-execution, abort remaining objectives and record them as SKIPPED
+      if (fatalError || executionHaltedByProvider) {
         for (let remIdx = objIdx + 1; remIdx < plannedObjectives.length; remIdx++) {
           const remObj = plannedObjectives[remIdx];
           const remId = remObj.id || `obj-${remIdx + 1}`;
+          const skipActual = fatalError
+            ? `Skipped: Execution aborted due to fatal infrastructure error: ${fatalError.message}`
+            : `Skipped: Execution halted because AI provider failed (${providerHaltReason || 'quota or service error'}). Completed steps preserved.`;
+          const skipExpected = fatalError
+            ? (remObj.expectedOutcome || 'Step skipped due to fatal infrastructure error')
+            : (remObj.expectedOutcome || 'Step skipped due to AI provider failure or quota exhaustion');
           executionSteps.push({
             stepIndex: currentStepIndex++,
             objectiveId: remId,
@@ -1056,8 +1163,8 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
             description: `Skip objective: ${remObj.description}`,
             status: 'SKIPPED',
             durationMs: 0,
-            expected: remObj.expectedOutcome || 'Step skipped due to fatal infrastructure error',
-            actual: `Skipped: Execution aborted due to fatal infrastructure error: ${fatalError.message}`,
+            expected: skipExpected,
+            actual: skipActual,
             screenshot: null,
           });
           objectiveOutcomes.set(remId, 'SKIPPED');
@@ -1128,6 +1235,8 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
 
   if (fatalError) {
     finalStatus = 'error';
+  } else if (executionHaltedByProvider) {
+    finalStatus = allOutcomes.includes('PASS') ? 'partial' : 'error';
   } else if (allOutcomes.includes('FAIL') || executionSteps.some((s) => s.status === 'FAIL' && !s.isRecovered)) {
     finalStatus = 'failed';
   } else if (allOutcomes.includes('ERROR') || executionSteps.some((s) => s.status === 'ERROR')) {
@@ -1144,9 +1253,15 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
 
   if (!failureAnalysis && failedSteps > 0) {
     const firstFailed = executionSteps.find((s) => s.status === 'FAIL');
+    const rawDesc = firstFailed?.actual || 'One or more test objectives failed verification.';
     failureAnalysis = {
-      description: firstFailed?.actual || 'One or more test objectives failed verification.',
+      description: rawDesc.startsWith('Verification failed') ? rawDesc : `Verification failed: ${rawDesc}`,
       hypothesis: 'The application did not exhibit the expected functional behavior.',
+    };
+  } else if (!failureAnalysis && executionHaltedByProvider) {
+    failureAnalysis = {
+      description: `Execution halted: AI provider unavailable (${providerHaltReason || 'quota or rate-limit'}). Completed steps preserved.`,
+      hypothesis: 'Provider quota exhausted or rate limit reached mid-execution.',
     };
   }
 
@@ -1159,10 +1274,17 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
     objective: trimmedInstructions,
     planner: {
       mode: 'llm_agent',
-      provider: provider.name,
-      model: provider.model,
-      aiConfigured: provider.name !== 'mock',
-      notice: `Autonomous QA Agent powered by ${provider.name.toUpperCase()} (${provider.model}). Real-time Observe-Plan-Act-Verify loop.`,
+      provider: activeProvider.name,
+      model: activeProvider.model,
+      aiConfigured: activeProvider.name !== 'mock',
+      fallbackUsed: providerSwitched ? providerSwitchDetails : null,
+      executionHalted: executionHaltedByProvider,
+      haltReason: executionHaltedByProvider ? providerHaltReason : null,
+      notice: providerSwitched
+        ? `Primary provider "${providerSwitchDetails.from}" failed at step ${providerSwitchDetails.stepIndex}. Seamlessly failed over to "${providerSwitchDetails.to}".`
+        : executionHaltedByProvider
+        ? `Execution halted mid-test due to AI provider failure: ${providerHaltReason}. Completed steps preserved.`
+        : `Autonomous QA Agent powered by ${activeProvider.name.toUpperCase()} (${activeProvider.model}). Real-time Observe-Plan-Act-Verify loop.`,
     },
     missingCredentials: credentials?.username ? [] : ['Test Account Credentials (Optional)'],
     prohibitedActions: [],
@@ -1200,7 +1322,9 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
           .join('; ') || 'None',
       missingPrerequisites: authFailed ? ['Authentication (Login verification failed)'] : [],
       ambiguousExpectations: null,
-      executionLimitations: `Bounded to maximum ${maxSteps} actions per journey for safety.`,
+      executionLimitations: executionHaltedByProvider
+        ? `Execution halted at step ${currentStepIndex} due to provider quota/error: ${providerHaltReason}. Completed steps preserved.`
+        : `Bounded to maximum ${maxSteps} actions per journey for safety.`,
     },
   };
 }
@@ -1280,7 +1404,17 @@ async function executeAgentAction(page, decision, timeout, context) {
         throw err;
       }
 
-      // Pre-click snapshot for dead-click detection
+      // Pre-click snapshot for dead-click detection and functional state update verification
+      const preClickBtnText = await locator.innerText({ timeout: 500 }).catch(() => locator.getAttribute('value', { timeout: 500 }).catch(() => ''));
+      const preClickBadge = await page
+        .evaluate(() => {
+          const b = document.querySelector(
+            '.shopping_cart_badge, [class*="cart" i][class*="badge" i], [data-testid*="cart" i], [aria-label*="cart" i], .cart-count'
+          );
+          return b ? (b.innerText || b.textContent || '').trim() : '';
+        })
+        .catch(() => '');
+
       const preClickSnapshot = await page
         .evaluate(() => {
           return {
@@ -1388,6 +1522,16 @@ async function executeAgentAction(page, decision, timeout, context) {
       }
 
       const postClickUrl = page.url();
+      const postClickBtnText = await locator.innerText({ timeout: 500 }).catch(() => locator.getAttribute('value', { timeout: 500 }).catch(() => ''));
+      const postClickBadge = await page
+        .evaluate(() => {
+          const b = document.querySelector(
+            '.shopping_cart_badge, [class*="cart" i][class*="badge" i], [data-testid*="cart" i], [aria-label*="cart" i], .cart-count'
+          );
+          return b ? (b.innerText || b.textContent || '').trim() : '';
+        })
+        .catch(() => '');
+
       const postClickSnapshot = await page
         .evaluate(() => {
           const el = document.querySelector(
@@ -1409,9 +1553,17 @@ async function executeAgentAction(page, decision, timeout, context) {
 
       const isUrlChanged = postClickUrl !== preClickUrl;
       const isNotificationShown = Boolean(postClickSnapshot?.notification);
+      const isBtnTextChanged = Boolean(
+        preClickBtnText && postClickBtnText && preClickBtnText.trim() !== postClickBtnText.trim()
+      );
+      const isBadgeChanged = Boolean(
+        postClickBadge && postClickBadge !== preClickBadge
+      );
       const isDomChanged =
         !preClickSnapshot ||
         !postClickSnapshot ||
+        isBtnTextChanged ||
+        isBadgeChanged ||
         Math.abs(postClickSnapshot.textLength - preClickSnapshot.textLength) > 0 ||
         postClickSnapshot.domCount !== preClickSnapshot.domCount ||
         postClickSnapshot.tableRows !== preClickSnapshot.tableRows;
@@ -1423,6 +1575,10 @@ async function executeAgentAction(page, decision, timeout, context) {
         clickActual = `Clicked "${target.value || target.name || 'control'}" and navigated to "${postClickUrl}"`;
       } else if (isNotificationShown) {
         clickActual = `Clicked "${target.value || target.name || 'control'}". Observed update: "${postClickSnapshot.notification}"`;
+      } else if (isBtnTextChanged) {
+        clickActual = `Clicked "${target.value || target.name || 'control'}". Observed state update: button text changed from "${preClickBtnText.trim()}" to "${postClickBtnText.trim()}"${isBadgeChanged ? ` (badge: "${postClickBadge}")` : ''}`;
+      } else if (isBadgeChanged) {
+        clickActual = `Clicked "${target.value || target.name || 'control'}". Observed state update: cart badge updated to "${postClickBadge}"`;
       } else if (!isDomChanged) {
         // Delayed state update check (up to 500ms)
         await page.waitForTimeout(500);
@@ -1637,10 +1793,23 @@ async function executeAgentAction(page, decision, timeout, context) {
             rawVal === '[VALID_USER]';
 
           const suppliedUser = context.credentials?.username || '';
+          const suppliedLocal = (suppliedUser.split('@')[0] || '').toLowerCase();
+          const rawLocal = (rawVal.split('@')[0] || '').toLowerCase();
+          const isLocalMatch =
+            Boolean(suppliedLocal && rawLocal) &&
+            (suppliedLocal === rawLocal ||
+              suppliedLocal.startsWith(rawLocal) ||
+              rawLocal.startsWith(suppliedLocal));
+          const isDomainMatch =
+            suppliedUser.includes('@') &&
+            rawVal.includes('@') &&
+            suppliedUser.split('@')[1].toLowerCase() === rawVal.split('@')[1].toLowerCase();
+
           const isAttemptedSuppliedMatch =
             Boolean(suppliedUser) &&
             (rawVal.toLowerCase() === suppliedUser.toLowerCase() ||
-              (suppliedUser.includes('@') && rawVal.toLowerCase() === suppliedUser.split('@')[0].toLowerCase()) ||
+              (suppliedUser.includes('@') && rawVal.toLowerCase() === suppliedLocal) ||
+              (isDomainMatch && isLocalMatch) ||
               (rawVal.length < suppliedUser.length && suppliedUser.toLowerCase().startsWith(rawVal.toLowerCase())));
 
           if (suppliedUser && (isPlaceholder || isAttemptedSuppliedMatch || hasValidIntent)) {
@@ -2396,7 +2565,7 @@ export function detectActionReasoningMismatch(decision, context = {}) {
     if (valueMatch && valueMatch[1]) {
       const cand = valueMatch[1].trim();
       if (
-        !/^(?:the|into|with|field|input|box|form|valid|invalid|credentials?|login|username|password|patient|contact|phone|email|name|data|text|value|search|query|details)$/i.test(
+        !/^(?:the|into|with|field|input|box|form|valid|invalid|credentials?|login|username|user|users|account|accounts|password|patient|contact|phone|email|name|data|text|value|search|query|details|existing|sample|duplicate|different|new|fresh|another|primary|backup|default)$/i.test(
           cand
         )
       ) {
@@ -2406,6 +2575,20 @@ export function detectActionReasoningMismatch(decision, context = {}) {
   }
 
   if (explicitIntendedVal) {
+    // If rawValue is an email but candidate is not an email, do not clobber valid email with prose word
+    if (rawValue.includes('@') && !explicitIntendedVal.includes('@')) {
+      return { valid: true };
+    }
+    const suppliedUser = context.credentials?.username || '';
+    // If the rawValue is already an attempted match for supplied credentials, never overwrite with reasoning artifact
+    if (
+      suppliedUser &&
+      (rawValue.toLowerCase() === suppliedUser.toLowerCase() ||
+        (suppliedUser.includes('@') && rawValue.toLowerCase() === suppliedUser.split('@')[0].toLowerCase()) ||
+        (suppliedUser.includes('@') && rawValue.includes('@') && suppliedUser.split('@')[1].toLowerCase() === rawValue.split('@')[1].toLowerCase()))
+    ) {
+      return { valid: true };
+    }
     // If thought explicitly specifies an intended test value (like "problem_user")
     // but action value has a different value (e.g. "[VALID_USERNAME]" or "standard_user")
     if (rawValue.toLowerCase() !== explicitIntendedVal.toLowerCase()) {
@@ -2445,7 +2628,7 @@ export function isLoginVerificationObjective(objective) {
     return false;
   }
 
-  const isAuthTerm = /\b(log[-_\s]*in|sign[-_\s]*in|logging[-_\s]*in|authenticate|authentication|auth[-_\s]*flow|login[-_\s]*page|signin[-_\s]*page|credentials|allows?\s*access|denies?\s*access)\b/i.test(text);
+  const isAuthTerm = /\b(log[-_\s]*in|sign[-_\s]*in|logging[-_\s]*in|authenticate|authentication|auth[-_\s]*flow|login[-_\s]*page|signin[-_\s]*page|credentials|allows?\s*access|denies?\s*access|[a-z0-9_]*_user|user[-_\s]*flow|user[-_\s]*behavior)\b/i.test(text);
   const isTestingTerm = /\b(verify|test|check|attempt|validate|exercise|assert|inspect|observe|view|explore|audit|navigate|reach|open|review|examination|inspection|layout|controls|authenticate|login|sign[-_\s]*in|rejection|denied|error)\b/i.test(text);
 
   return isAuthTerm && (isTestingTerm || text.includes('credential'));
@@ -2856,8 +3039,8 @@ export function checkObjectiveDependencies(
       if (isCurrentAuthObjective) {
         continue;
       }
-      // 3. If current objective is an independent public flow (does not require auth), it can run independently
-      if (!currentRequiresAuth && !isCurrentAuthObjective) {
+      // 3. If current objective is an independent public flow (does not require auth) and failed dep was auth, it can run independently
+      if (!currentRequiresAuth && !isCurrentAuthObjective && isDepAuthObjective) {
         continue;
       }
 
@@ -2888,7 +3071,7 @@ export function checkObjectiveDependencies(
         if (isCurrentAuthObjective) {
           continue;
         }
-        if (!currentRequiresAuth && !isCurrentAuthObjective) {
+        if (!currentRequiresAuth && !isCurrentAuthObjective && isDepAuthObjective) {
           continue;
         }
 

@@ -1,6 +1,7 @@
 import { GeminiProvider } from './geminiProvider.js';
 import { OpenAiProvider } from './openaiProvider.js';
 import { MockProvider } from './mockProvider.js';
+import { executeWithRetry } from './retryHelper.js';
 
 export {
   ProviderError,
@@ -11,6 +12,7 @@ export {
   sanitizeErrorString,
 } from './providerSanitizer.js';
 
+export { executeWithRetry };
 export { GeminiProvider, OpenAiProvider, MockProvider };
 
 /**
@@ -238,6 +240,66 @@ export function validateAgentDecision(decision, options = {}) {
 }
 
 /**
+ * Returns primary and fallback AI provider instances.
+ * If both Gemini and OpenAI are configured, the second acts as seamless failover.
+ *
+ * @param {object} [options]
+ * @returns {{ primaryProvider: GeminiProvider | OpenAiProvider | MockProvider | null, fallbackProvider: GeminiProvider | OpenAiProvider | MockProvider | null }}
+ */
+export function getAiProviderBundle(options = {}) {
+  if (options.provider) {
+    return {
+      primaryProvider: options.provider,
+      fallbackProvider: options.fallbackProvider || null,
+    };
+  }
+
+  if (
+    options.allowMock &&
+    (options.mockSteps || options.mockObjectives || process.env.TESTIT_USE_MOCK_AGENT === 'true')
+  ) {
+    const mock = new MockProvider(options.mockSteps || [], options.mockObjectives || null);
+    return {
+      primaryProvider: mock,
+      fallbackProvider: options.fallbackProvider || null,
+    };
+  }
+
+  let primary = null;
+  let fallback = null;
+
+  const hasGemini = Boolean(process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY.trim());
+  const hasOpenAi = Boolean(process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY.trim());
+
+  if (hasGemini) {
+    primary = new GeminiProvider(
+      process.env.GEMINI_API_KEY.trim(),
+      process.env.GEMINI_MODEL || 'gemini-2.5-flash',
+      options
+    );
+    if (hasOpenAi) {
+      fallback = new OpenAiProvider(
+        process.env.OPENAI_API_KEY.trim(),
+        process.env.OPENAI_MODEL || 'gpt-4o-mini',
+        options
+      );
+    }
+  } else if (hasOpenAi) {
+    primary = new OpenAiProvider(
+      process.env.OPENAI_API_KEY.trim(),
+      process.env.OPENAI_MODEL || 'gpt-4o-mini',
+      options
+    );
+  }
+
+  if (options.fallbackProvider) {
+    fallback = options.fallbackProvider;
+  }
+
+  return { primaryProvider: primary, fallbackProvider: fallback };
+}
+
+/**
  * Returns the configured AI provider instance or null.
  * Strictly reads from environment variables.
  *
@@ -247,34 +309,8 @@ export function validateAgentDecision(decision, options = {}) {
  * @returns {GeminiProvider | OpenAiProvider | MockProvider | null}
  */
 export function getActiveAiProvider(options = {}) {
-  if (options.provider) {
-    return options.provider;
-  }
-
-  if (
-    options.allowMock &&
-    (options.mockSteps || options.mockObjectives || process.env.TESTIT_USE_MOCK_AGENT === 'true')
-  ) {
-    return new MockProvider(options.mockSteps || [], options.mockObjectives || null);
-  }
-
-  if (process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY.trim()) {
-    return new GeminiProvider(
-      process.env.GEMINI_API_KEY.trim(),
-      process.env.GEMINI_MODEL || 'gemini-2.5-flash',
-      options
-    );
-  }
-
-  if (process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY.trim()) {
-    return new OpenAiProvider(
-      process.env.OPENAI_API_KEY.trim(),
-      process.env.OPENAI_MODEL || 'gpt-4o-mini',
-      options
-    );
-  }
-
-  return null;
+  const bundle = getAiProviderBundle(options);
+  return bundle.primaryProvider;
 }
 
 /**

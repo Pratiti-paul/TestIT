@@ -9,11 +9,13 @@ import {
   wrapProviderError,
   redactSecrets,
 } from './providerSanitizer.js';
+import { executeWithRetry } from './retryHelper.js';
 
 export class OpenAiProvider {
   constructor(apiKey, model = 'gpt-4o-mini', options = {}) {
     this.apiKey = apiKey;
     this.model = model;
+    this.options = options;
     this.name = 'openai';
     this.timeoutMs =
       options.timeoutMs ||
@@ -43,34 +45,50 @@ Requirements:
     }`;
 
     try {
-      const response = await fetch(endpoint, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${this.apiKey}`,
-        },
-        body: JSON.stringify({
-          model: this.model,
-          response_format: { type: 'json_object' },
-          temperature: 0.1,
-          max_tokens: this.maxPlanningTokens,
-          messages: [
-            { role: 'system', content: systemInstruction },
-            { role: 'user', content: userPrompt },
-          ],
-        }),
-        signal: AbortSignal.timeout(this.timeoutMs),
-      });
+      const response = await executeWithRetry(
+        async () => {
+          const res = await fetch(endpoint, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${this.apiKey}`,
+            },
+            body: JSON.stringify({
+              model: this.model,
+              response_format: { type: 'json_object' },
+              temperature: 0.1,
+              max_tokens: this.maxPlanningTokens,
+              messages: [
+                { role: 'system', content: systemInstruction },
+                { role: 'user', content: userPrompt },
+              ],
+            }),
+            signal: AbortSignal.timeout(this.timeoutMs),
+          });
 
-      if (!response.ok) {
-        const errText = await response.text().catch(() => '');
-        throw createProviderHttpError({
+          if (!res.ok) {
+            const errText = await res.text().catch(() => '');
+            throw createProviderHttpError({
+              providerName: 'OpenAI',
+              status: res.status,
+              rawBody: errText,
+              apiKey: this.apiKey,
+              headers: res.headers,
+            });
+          }
+
+          return res;
+        },
+        {
           providerName: 'OpenAI',
-          status: response.status,
-          rawBody: errText,
           apiKey: this.apiKey,
-        });
-      }
+          timeoutMs: this.timeoutMs,
+          maxRetries: this.options?.maxRetries,
+          baseDelayMs: this.options?.baseDelayMs,
+          maxDelayMs: this.options?.maxDelayMs,
+          totalTimeoutMs: this.options?.totalTimeoutMs,
+        }
+      );
 
       const data = await response.json().catch(() => {
         throw new ProviderError('OpenAI API returned an unparseable response payload.', {
@@ -196,34 +214,50 @@ Return JSON with:
     };
 
     try {
-      const response = await fetch(endpoint, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${this.apiKey}`,
-        },
-        body: JSON.stringify({
-          model: this.model,
-          response_format: { type: 'json_object' },
-          temperature: 0.1,
-          max_tokens: this.maxStepTokens,
-          messages: [
-            { role: 'system', content: systemInstruction },
-            { role: 'user', content: JSON.stringify(promptContext) },
-          ],
-        }),
-        signal: AbortSignal.timeout(this.timeoutMs),
-      });
+      const response = await executeWithRetry(
+        async () => {
+          const res = await fetch(endpoint, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${this.apiKey}`,
+            },
+            body: JSON.stringify({
+              model: this.model,
+              response_format: { type: 'json_object' },
+              temperature: 0.1,
+              max_tokens: this.maxStepTokens,
+              messages: [
+                { role: 'system', content: systemInstruction },
+                { role: 'user', content: JSON.stringify(promptContext) },
+              ],
+            }),
+            signal: AbortSignal.timeout(this.timeoutMs),
+          });
 
-      if (!response.ok) {
-        const errText = await response.text().catch(() => '');
-        throw createProviderHttpError({
+          if (!res.ok) {
+            const errText = await res.text().catch(() => '');
+            throw createProviderHttpError({
+              providerName: 'OpenAI',
+              status: res.status,
+              rawBody: errText,
+              apiKey: this.apiKey,
+              headers: res.headers,
+            });
+          }
+
+          return res;
+        },
+        {
           providerName: 'OpenAI',
-          status: response.status,
-          rawBody: errText,
           apiKey: this.apiKey,
-        });
-      }
+          timeoutMs: this.timeoutMs,
+          maxRetries: this.options?.maxRetries,
+          baseDelayMs: this.options?.baseDelayMs,
+          maxDelayMs: this.options?.maxDelayMs,
+          totalTimeoutMs: this.options?.totalTimeoutMs,
+        }
+      );
 
       const data = await response.json().catch(() => {
         throw new ProviderError('OpenAI API returned an unparseable response payload.', {

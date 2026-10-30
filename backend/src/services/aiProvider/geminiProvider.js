@@ -15,11 +15,13 @@ import {
   wrapProviderError,
   redactSecrets,
 } from './providerSanitizer.js';
+import { executeWithRetry } from './retryHelper.js';
 
 export class GeminiProvider {
   constructor(apiKey, model = 'gemini-3.5-flash-lite', options = {}) {
     this.apiKey = apiKey;
     this.model = model;
+    this.options = options;
     this.name = 'gemini';
     this.timeoutMs =
       options.timeoutMs ||
@@ -107,26 +109,42 @@ Test Credentials Available: ${credentials?.username ? 'Yes (Username/Password pr
       const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${activeModel}:generateContent`;
 
       let response;
-      const maxRetries = 2;
-      for (let attempt = 1; attempt <= maxRetries; attempt++) {
-        try {
-          response = await fetch(endpoint, {
-            ...planPayload,
-            signal: AbortSignal.timeout(this.timeoutMs),
-          });
-        } catch (firstErr) {
-          if (attempt === maxRetries) throw firstErr;
-          await new Promise((r) => setTimeout(r, 1000 * attempt));
+      try {
+        response = await executeWithRetry(
+          async () => {
+            const res = await fetch(endpoint, {
+              ...planPayload,
+              signal: AbortSignal.timeout(this.timeoutMs),
+            });
+            if (!res.ok) {
+              const errText = await res.text().catch(() => '');
+              throw createProviderHttpError({
+                providerName: 'Gemini',
+                status: res.status,
+                rawBody: errText,
+                apiKey: this.apiKey,
+                headers: res.headers,
+              });
+            }
+            return res;
+          },
+          {
+            providerName: 'Gemini',
+            apiKey: this.apiKey,
+            timeoutMs: this.timeoutMs,
+            maxRetries: this.options?.maxRetries,
+            baseDelayMs: this.options?.baseDelayMs,
+            maxDelayMs: this.options?.maxDelayMs,
+            totalTimeoutMs: this.options?.totalTimeoutMs,
+          }
+        );
+      } catch (retryErr) {
+        lastHttpError = retryErr;
+        if ((retryErr.status === 503 || retryErr.status === 404) && mIdx < candidateModels.length - 1) {
+          console.log(`[Gemini Provider]: Model "${activeModel}" returned HTTP ${retryErr.status}. Trying fallback model "${candidateModels[mIdx + 1]}".`);
           continue;
         }
-
-        if ((response.status === 429 || response.status === 503) && attempt < maxRetries) {
-          const retryAfterSec = parseInt(response.headers?.get?.('retry-after') || '0', 10);
-          const waitMs = retryAfterSec > 0 ? retryAfterSec * 1000 : 1500 * attempt;
-          await new Promise((r) => setTimeout(r, waitMs));
-          continue;
-        }
-        break;
+        throw retryErr;
       }
 
       if (response && response.ok) {
@@ -369,26 +387,42 @@ Return ONLY valid JSON matching this schema:
       const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${activeModel}:generateContent`;
 
       let response;
-      const maxRetries = 2;
-      for (let attempt = 1; attempt <= maxRetries; attempt++) {
-        try {
-          response = await fetch(endpoint, {
-            ...fetchPayload,
-            signal: AbortSignal.timeout(this.timeoutMs),
-          });
-        } catch (firstErr) {
-          if (attempt === maxRetries) throw firstErr;
-          await new Promise((r) => setTimeout(r, 1000 * attempt));
+      try {
+        response = await executeWithRetry(
+          async () => {
+            const res = await fetch(endpoint, {
+              ...fetchPayload,
+              signal: AbortSignal.timeout(this.timeoutMs),
+            });
+            if (!res.ok) {
+              const errText = await res.text().catch(() => '');
+              throw createProviderHttpError({
+                providerName: 'Gemini',
+                status: res.status,
+                rawBody: errText,
+                apiKey: this.apiKey,
+                headers: res.headers,
+              });
+            }
+            return res;
+          },
+          {
+            providerName: 'Gemini',
+            apiKey: this.apiKey,
+            timeoutMs: this.timeoutMs,
+            maxRetries: this.options?.maxRetries,
+            baseDelayMs: this.options?.baseDelayMs,
+            maxDelayMs: this.options?.maxDelayMs,
+            totalTimeoutMs: this.options?.totalTimeoutMs,
+          }
+        );
+      } catch (retryErr) {
+        lastHttpError = retryErr;
+        if ((retryErr.status === 503 || retryErr.status === 404) && mIdx < candidateModels.length - 1) {
+          console.log(`[Gemini Provider]: Model "${activeModel}" returned HTTP ${retryErr.status}. Trying fallback model "${candidateModels[mIdx + 1]}".`);
           continue;
         }
-
-        if ((response.status === 429 || response.status === 503) && attempt < maxRetries) {
-          const retryAfterSec = parseInt(response.headers?.get?.('retry-after') || '0', 10);
-          const waitMs = retryAfterSec > 0 ? retryAfterSec * 1000 : 1500 * attempt;
-          await new Promise((r) => setTimeout(r, waitMs));
-          continue;
-        }
-        break;
+        throw retryErr;
       }
 
       if (response && response.ok) {
