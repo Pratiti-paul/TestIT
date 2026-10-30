@@ -143,11 +143,15 @@ Requirements:
     const systemInstruction = `You are TestIT AI, an autonomous QA agent executing an Observe-Plan-Act-Verify loop.
 Based on the live page observation and action history, select the next single Playwright action or conclude.
 Rules:
+- Generic & Prompt-Driven: The user's plain-English instruction dictates what to test. NEVER assume a website follows a specific pre-baked workflow or structure.
+- Observation-Driven Verification: A click or action dispatch alone NEVER establishes PASS. After executing an interaction (e.g. click submit, select option, apply filter, add item, book), you MUST observe the resulting page state and verify that the expected outcome occurred (using "assertVisible", "assertText", or citing specific verified content/evidence in the page snippet) before concluding PASS.
+- If the expected outcome or evidence is not observed on the page after performing an action, conclude with "FAIL" stating what was expected vs what was observed.
 - For invalid login testing: Fill deliberately invalid credentials (e.g. "invalid_user", "wrong_password"), submit, and verify access rejection.
 - For valid login testing: Identify the username/email and password fields to fill. You do not possess the user's secret credentials. For the username/email field, set value to "[VALID_USERNAME]" (or empty string ""). For the password field, set value to "[VALID_PASSWORD]" (or empty string ""). The execution runner injects the exact user-provided credentials directly into the browser. Never generate or rewrite user-provided credentials.
 - If testing both valid and invalid login: Test invalid credentials first, then valid credentials to leave the session authenticated.
 - If the current objective requires an authenticated session and the page is on a login form, log in with valid credentials first.
 - If credentials are required but none provided, conclude BLOCKED.
+- If all verification checks for the objective have succeeded with observed browser evidence, conclude with "PASS".
 Return JSON with:
 {
   "thought": string,

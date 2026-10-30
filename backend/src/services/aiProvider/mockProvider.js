@@ -6,8 +6,18 @@ export class MockProvider {
   constructor(customSteps = [], customObjectives = null) {
     this.name = 'mock';
     this.model = 'mock-test-agent';
-    this.customSteps = customSteps;
-    this.customObjectives = customObjectives;
+    if (
+      customSteps &&
+      typeof customSteps === 'object' &&
+      !Array.isArray(customSteps) &&
+      (customSteps.customSteps || customSteps.customObjectives || customSteps.customPlan)
+    ) {
+      this.customSteps = customSteps.customSteps || [];
+      this.customObjectives = customSteps.customObjectives || customSteps.customPlan || null;
+    } else {
+      this.customSteps = customSteps;
+      this.customObjectives = customObjectives;
+    }
     this.stepIndex = 0;
   }
 
@@ -21,6 +31,11 @@ export class MockProvider {
   }
 
   async planObjectives({ url, instructions }) {
+    if (typeof this.customObjectives === 'function') {
+      const res = this.customObjectives({ url, instructions });
+      return res?.objectives ? res : { objectives: res };
+    }
+
     if (Array.isArray(this.customObjectives) && this.customObjectives.length > 0) {
       return { objectives: this.customObjectives };
     }

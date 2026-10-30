@@ -110,6 +110,10 @@ export function validateAgentDecision(decision) {
  * @returns {GeminiProvider | OpenAiProvider | MockProvider | null}
  */
 export function getActiveAiProvider(options = {}) {
+  if (options.provider) {
+    return options.provider;
+  }
+
   if (
     options.allowMock &&
     (options.mockSteps || options.mockObjectives || process.env.TESTIT_USE_MOCK_AGENT === 'true')

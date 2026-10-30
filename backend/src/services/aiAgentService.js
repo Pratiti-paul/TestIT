@@ -265,11 +265,13 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
                 localStorage.getItem('auth_token') ||
                 localStorage.getItem('jwt')
             );
-            const isAuthUrl = /\/(home|dashboard|account|profile|cart)/i.test(window.location.pathname);
             const hasLogout = Array.from(document.querySelectorAll('button, a')).some((b) =>
               /log\s*out|sign\s*out/i.test(b.innerText || b.textContent || '')
             );
-            return hasToken || (isAuthUrl && hasLogout);
+            const hasProfileControl = Boolean(
+              document.querySelector('[aria-label*="profile" i], [aria-label*="account" i], .user-avatar, .user-profile')
+            );
+            return hasToken || hasLogout || hasProfileControl;
           })
           .catch(() => false);
 
@@ -1100,7 +1102,29 @@ async function executeAgentAction(page, decision, timeout, context) {
         await page.waitForTimeout(300);
       }
 
-      return { actual: `Click dispatched successfully on "${target.value}"` };
+      const postClickUrl = page.url();
+      let clickActual = `Click dispatched successfully on "${target.value || target.name || 'control'}"`;
+      if (postClickUrl !== preClickUrl) {
+        clickActual = `Clicked "${target.value || target.name || 'control'}" and navigated to "${postClickUrl}"`;
+      } else {
+        const postState = await page
+          .evaluate(() => {
+            const el = document.querySelector(
+              '[role="status"], [role="alert"], .alert, .modal, .toast, .confirmation, [aria-live="polite"], .booking-confirmation, .order-confirmation'
+            );
+            if (el && el.offsetWidth > 0 && el.offsetHeight > 0) {
+              return (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 100);
+            }
+            return null;
+          })
+          .catch(() => null);
+
+        if (postState) {
+          clickActual = `Clicked "${target.value || target.name || 'control'}". Observed update: "${postState}"`;
+        }
+      }
+
+      return { actual: clickActual };
     }
 
     case 'fill': {
@@ -1310,82 +1334,190 @@ async function executeAgentAction(page, decision, timeout, context) {
 }
 
 /**
- * Resolves a locator using accessible roles, labels, text, or CSS.
+ * Resolves a locator using accessible roles, labels, text, or CSS with
+ * generic discovery and multi-tier recovery when primary matching fails.
  */
 async function resolveAgentLocator(page, target, timeout, decision = null) {
+  if (!target) throw new Error('Action decision missing target specification.');
   const { strategy, value, name } = target;
 
-  let locator = null;
-  switch (strategy) {
-    case 'role': {
-      if (name) {
-        locator = page.getByRole(value, { name });
-      } else {
-        // If the LLM specified a generic role like 'button' without a name,
-        // check whether the thought explicitly named the target control
-        let candidateName = null;
-        const thought = String(decision?.thought || decision?.description || '');
-        if (thought) {
-          const quoted = thought.match(/['"`]([^'"`]{2,30})['"`]/);
-          if (quoted && quoted[1]) {
-            candidateName = quoted[1].trim();
-          } else {
-            const verbMatch = thought.match(/\b(?:click|press|submit|tap)\s+(?:the\s+)?([A-Za-z0-9_-]{2,20})(?:\s+button|\s+link)?/i);
-            if (verbMatch && verbMatch[1] && !['the', 'a', 'this', 'that', 'button', 'link', 'form'].includes(verbMatch[1].toLowerCase())) {
-              candidateName = verbMatch[1].trim();
-            }
-          }
-        }
+  const escapeRegex = (str) => String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-        if (candidateName) {
-          const named = page.getByRole(value, { name: new RegExp(candidateName, 'i') });
-          const count = await named.count().catch(() => 0);
-          if (count > 0) {
-            locator = named;
-          } else {
-            locator = page.getByRole(value);
-          }
-        } else if (value === 'button' && /\b(submit|login|sign\s*in|log\s*in)\b/i.test(thought)) {
-          const submitBtn = page.locator('button[type="submit"], input[type="submit"], button:has-text("Login"), button:has-text("Sign In")');
-          const count = await submitBtn.count().catch(() => 0);
-          locator = count > 0 ? submitBtn : page.getByRole(value);
-        } else {
-          locator = page.getByRole(value);
+  // Helper to build primary locator
+  const buildPrimaryLocator = (strat, val, nm) => {
+    switch (strat) {
+      case 'role': {
+        if (nm) {
+          return page.getByRole(val, { name: nm });
         }
+        return page.getByRole(val);
       }
-      break;
-    }
-    case 'label':
-      locator = page.getByLabel(value);
-      break;
-    case 'placeholder':
-      locator = page.getByPlaceholder(value);
-      break;
-    case 'text': {
-      // Prioritize interactive controls (buttons, links, inputs) matching exact text
-      const escaped = String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      const interactiveExact = page
-        .locator('button, a, input[type="submit"], input[type="button"], [role="button"]')
-        .filter({ hasText: new RegExp(`^${escaped}$`, 'i') });
-      const count = await interactiveExact.count().catch(() => 0);
-      if (count > 0) {
-        locator = interactiveExact;
-      } else {
-        const exact = page.getByText(value, { exact: true });
-        const exactCount = await exact.count().catch(() => 0);
-        locator = exactCount > 0 ? exact : page.getByText(value);
+      case 'label':
+        return page.getByLabel(val);
+      case 'placeholder':
+        return page.getByPlaceholder(val);
+      case 'text': {
+        return page.getByText(val);
       }
-      break;
+      case 'css':
+      default:
+        return page.locator(val);
     }
-    case 'css':
-    default:
-      locator = page.locator(value);
-      break;
+  };
+
+  const primaryLocator = buildPrimaryLocator(strategy, value, name);
+
+  // 1. Primary fast attempt (up to 2500ms or remaining timeout)
+  const primaryWaitMs = Math.min(timeout, 2500);
+  try {
+    const isPrimaryVis = await primaryLocator.first().isVisible({ timeout: primaryWaitMs }).catch(() => false);
+    if (isPrimaryVis) {
+      return primaryLocator.first();
+    }
+  } catch {
+    // Proceed to generic recovery
   }
 
-  // Wait for element visibility
-  await locator.first().waitFor({ state: 'visible', timeout });
-  return locator.first();
+  // 2. Generic Locator Discovery and Recovery
+  const targetLabel = name || value || '';
+  const cleanLabel = String(targetLabel).replace(/[^\p{L}\p{N}\s_\-]/gu, '').trim();
+  const candidateKeywords = [cleanLabel, targetLabel]
+    .filter(Boolean)
+    .filter((w) => w.length >= 2);
+
+  // 2A. Role-based recovery: Case-insensitive / substring / cross-role discovery
+  if (strategy === 'role' && candidateKeywords.length > 0) {
+    for (const kw of candidateKeywords) {
+      // Try regex name match on the same role
+      const regexRole = page.getByRole(value, { name: new RegExp(escapeRegex(kw), 'i') });
+      if (await regexRole.first().isVisible({ timeout: 800 }).catch(() => false)) {
+        console.log(`[Locator Recovery]: Recovered element with role "${value}" matching "${kw}".`);
+        return regexRole.first();
+      }
+
+      // Cross-role discovery (e.g. model guessed link but element is button, or vice-versa)
+      const altRoles = value === 'link' ? ['button', 'tab'] : value === 'button' ? ['link', 'tab'] : ['button', 'link'];
+      for (const altRole of altRoles) {
+        const altRoleLoc = page.getByRole(altRole, { name: new RegExp(escapeRegex(kw), 'i') });
+        if (await altRoleLoc.first().isVisible({ timeout: 800 }).catch(() => false)) {
+          console.log(`[Locator Recovery]: Recovered cross-role element with role "${altRole}" matching "${kw}".`);
+          return altRoleLoc.first();
+        }
+      }
+
+      // Match interactive controls (button, a, role=button) containing text or aria-label
+      const interactiveMatch = page
+        .locator('button, a, input[type="button"], input[type="submit"], [role="button"], [role="link"], [role="tab"]')
+        .filter({ hasText: new RegExp(escapeRegex(kw), 'i') });
+      if (await interactiveMatch.first().isVisible({ timeout: 800 }).catch(() => false)) {
+        console.log(`[Locator Recovery]: Recovered interactive element with text matching "${kw}".`);
+        return interactiveMatch.first();
+      }
+    }
+  }
+
+  // 2B. Text-based recovery
+  if (strategy === 'text' && value) {
+    const textRegex = page.getByText(new RegExp(escapeRegex(cleanLabel || value), 'i'));
+    if (await textRegex.first().isVisible({ timeout: 800 }).catch(() => false)) {
+      console.log(`[Locator Recovery]: Recovered text element via case-insensitive matching: "${cleanLabel || value}".`);
+      return textRegex.first();
+    }
+
+    const textSubLoc = page
+      .locator('button, a, input[type="button"], input[type="submit"], [role="button"], [role="link"], [role="tab"]')
+      .filter({ hasText: new RegExp(escapeRegex(cleanLabel || value), 'i') });
+    if (await textSubLoc.first().isVisible({ timeout: 800 }).catch(() => false)) {
+      console.log(`[Locator Recovery]: Recovered text element via interactive substring matching: "${cleanLabel || value}".`);
+      return textSubLoc.first();
+    }
+
+    const ariaMatch = page.locator(`[aria-label*="${cleanLabel || value}" i], [title*="${cleanLabel || value}" i]`);
+    if (await ariaMatch.first().isVisible({ timeout: 800 }).catch(() => false)) {
+      console.log(`[Locator Recovery]: Recovered text element via aria-label/title: "${cleanLabel || value}".`);
+      return ariaMatch.first();
+    }
+  }
+
+  // 2C. CSS-based recovery (extract text query from :has-text or :text)
+  if (strategy === 'css' && value) {
+    const textInCss = value.match(/:(?:has-text|text)\(['"]?([^'")]+)['"]?\)/i);
+    if (textInCss && textInCss[1]) {
+      const extractedText = textInCss[1].trim();
+      const cssRecovered = page
+        .locator('button, a, [role="button"], [role="link"]')
+        .filter({ hasText: new RegExp(escapeRegex(extractedText), 'i') });
+      if (await cssRecovered.first().isVisible({ timeout: 800 }).catch(() => false)) {
+        console.log(`[Locator Recovery]: Recovered CSS element via extracted text query "${extractedText}".`);
+        return cssRecovered.first();
+      }
+    }
+  }
+
+  // 2D. Semantic live DOM inspection & intent-driven recovery
+  try {
+    const liveControls = await page.evaluate(() => {
+      const isVis = (el) => el.offsetWidth > 0 && el.offsetHeight > 0;
+      const els = Array.from(
+        document.querySelectorAll(
+          'button, a, input, select, textarea, [role="button"], [role="link"], [role="tab"]'
+        )
+      );
+      return els.filter(isVis).map((el) => ({
+        tag: el.tagName.toLowerCase(),
+        role: el.getAttribute('role') || el.tagName.toLowerCase(),
+        text: (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 60),
+        ariaLabel: (el.getAttribute('aria-label') || '').trim(),
+        title: (el.getAttribute('title') || '').trim(),
+        placeholder: (el.getAttribute('placeholder') || '').trim(),
+        id: el.id || '',
+        href: el.getAttribute('href') || '',
+        type: el.getAttribute('type') || '',
+      }));
+    });
+
+    if (Array.isArray(liveControls) && liveControls.length > 0) {
+      // Find candidate control with highest semantic relevance to target/thought
+      const semanticCandidates = liveControls.filter((ctrl) => {
+        const ctrlText = `${ctrl.text} ${ctrl.ariaLabel} ${ctrl.title} ${ctrl.placeholder} ${ctrl.href}`.toLowerCase();
+        return candidateKeywords.some((kw) => ctrlText.includes(kw.toLowerCase()));
+      });
+
+      if (semanticCandidates.length > 0) {
+        const best = semanticCandidates[0];
+        let recoveredLoc = null;
+        if (best.id) {
+          recoveredLoc = page.locator(`#${best.id}`);
+        } else if (best.ariaLabel) {
+          recoveredLoc = page.locator(`[aria-label="${best.ariaLabel}"]`);
+        } else if (best.href) {
+          recoveredLoc = page.locator(`a[href="${best.href}"]`);
+        } else if (best.text) {
+          recoveredLoc = page.getByText(best.text, { exact: true });
+        }
+
+        if (recoveredLoc && (await recoveredLoc.first().isVisible({ timeout: 800 }).catch(() => false))) {
+          console.log(`[Locator Recovery]: Dynamically recovered control <${best.tag}> with text="${best.text || best.ariaLabel}".`);
+          return recoveredLoc.first();
+        }
+      }
+    }
+  } catch {
+    // Non-fatal if page evaluation fails
+  }
+
+  // 3. Final attempt with primary locator or report genuine failure
+  const remainingWaitMs = Math.max(1000, Math.min(timeout - primaryWaitMs, 3000));
+  const finalCheck = await primaryLocator.first().isVisible({ timeout: remainingWaitMs }).catch(() => false);
+  if (finalCheck) {
+    return primaryLocator.first();
+  }
+
+  const notFoundErr = new Error(
+    `Element matching "${name || value}" (strategy: ${strategy}) could not be located on the page after inspecting live roles, accessible names, and visible controls.`
+  );
+  notFoundErr.statusType = 'FAIL';
+  throw notFoundErr;
 }
 
 /**

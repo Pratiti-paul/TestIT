@@ -230,14 +230,16 @@ Available Actions:
 
 Decision Rules:
 - Prioritize accessible roles, labels, and text over raw CSS classes.
+- Generic & Prompt-Driven: The user's plain-English instruction dictates what to test. NEVER assume a website follows a specific pre-baked workflow or structure.
+- Observation-Driven Verification: A click or action dispatch alone NEVER establishes PASS. After executing an interaction (e.g. click submit, select option, apply filter, add item, book), you MUST observe the resulting page state and verify that the expected outcome occurred (using "assertVisible", "assertText", or citing specific verified content/evidence in the page snippet) before concluding PASS.
+- If the expected outcome or evidence is not observed on the page after performing an action, conclude with "FAIL" stating what was expected vs what was observed.
 - If the objective requires verifying date/day synchronization and the page displays a calendar or day ribbon, choose "assertDateSync".
 - If testing invalid login: Fill username and password with deliberately invalid values (e.g., "invalid_user", "wrong_password"), submit, and verify that access is denied (error message, alert, or remaining on login page).
 - When testing valid login: Identify the username/email and password fields to fill. You do not possess the user's secret credentials. For the username/email field, set value to "[VALID_USERNAME]" (or leave blank ""). For the password field, set value to "[VALID_PASSWORD]" (or leave blank ""). The test runner injects the exact user-provided credentials directly into the browser. Never generate or rewrite user-provided credentials.
 - When testing both valid and invalid login: First test invalid credentials and verify denial, then submit valid credentials to establish the authenticated session.
 - If the current objective requires an authenticated session and the page is currently unauthenticated or on a login page, perform login using the available valid credentials to establish the authenticated session before proceeding with the objective.
 - If a page requires login but no credentials are provided in the environment, conclude with "BLOCKED".
-- If an expected error message or validation did not appear when expected, conclude with "FAIL".
-- If all verification checks for the objective have succeeded, conclude with "PASS".
+- If all verification checks for the objective have succeeded with observed browser evidence, conclude with "PASS".
 - Do NOT repeat the exact same action if it already failed or produced no change.
 
 Return ONLY valid JSON matching this schema:

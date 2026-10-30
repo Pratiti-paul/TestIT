@@ -169,9 +169,9 @@ export async function verifyAuthenticationSuccess(page, options = {}) {
             }
           }
 
-          // Check for authenticated navigation areas (e.g. cart, appointments, dashboard, home)
+          // Check for authenticated navigation areas (e.g. dashboard, account, profile, portal, settings)
           const authenticatedNav = Array.from(
-            document.querySelectorAll('a[href*="dashboard" i], a[href*="cart" i], a[href*="my-" i], a[href*="home" i]')
+            document.querySelectorAll('a[href*="dashboard" i], a[href*="account" i], a[href*="profile" i], a[href*="portal" i], a[href*="settings" i], a[href*="my-" i]')
           ).filter((el) => el.offsetWidth > 0 && el.offsetHeight > 0);
           if (authenticatedNav.length > 0) {
             discoveredIndicators.push('Authenticated navigation links');
