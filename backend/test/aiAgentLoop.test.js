@@ -194,7 +194,7 @@ describe('Autonomous AI QA Agent Suite', () => {
                   const dash = document.getElementById('user-dashboard');
                   err.style.display = 'none';
 
-                  if (u === 'validuser' && p === 'validpass123') {
+                  if ((u === 'validuser' || u === 'abc@gmail.com') && (p === 'validpass123' || p === 'SuperSecret123!@#')) {
                     document.getElementById('login-form').style.display = 'none';
                     document.getElementById('user-display').textContent = 'Logged in as ' + u;
                     dash.style.display = 'block';
@@ -873,6 +873,17 @@ describe('Autonomous AI QA Agent Suite', () => {
       assert.equal(requiresValidCredentials(objLoginInvalidOnly), false);
       assert.equal(requiresAuthenticatedSession(objLoginInvalidOnly), false);
 
+      // Login page inspection objective (must NOT require credentials or existing session)
+      const objLoginInspect = {
+        id: 'obj-inspect-only',
+        description: 'Inspect login page layout and verify presence of sign-in form controls',
+        targetBehavior: 'Login page inspection',
+        preconditions: ['Login page accessible'],
+      };
+      assert.equal(isLoginVerificationObjective(objLoginInspect), true);
+      assert.equal(requiresValidCredentials(objLoginInspect), false);
+      assert.equal(requiresAuthenticatedSession(objLoginInspect), false);
+
       // Authenticated non-login objectives (strictly require active session)
       const objProfile = {
         id: 'obj-3',
@@ -1288,6 +1299,225 @@ describe('Autonomous AI QA Agent Suite', () => {
       const calendarStep = report.steps.find((s) => s.objectiveId === 'obj-independent-calendar');
       assert.ok(calendarStep);
       assert.equal(calendarStep.status, 'PASS');
+    });
+
+    it('6. executes login-page inspection without credentials or an existing session', async () => {
+      const mockObjectives = [
+        {
+          id: 'obj-inspect',
+          description: 'Inspect login page layout and verify presence of sign-in form controls',
+          targetBehavior: 'Login page inspection',
+        },
+      ];
+
+      const mockSteps = [
+        {
+          thought: 'Verify username input field is visible',
+          action: 'assertVisible',
+          target: { strategy: 'placeholder', value: 'Username' },
+        },
+        {
+          thought: 'Verify password input field is visible',
+          action: 'assertVisible',
+          target: { strategy: 'placeholder', value: 'Password' },
+        },
+        {
+          thought: 'Verify submit button is visible',
+          action: 'assertVisible',
+          target: { strategy: 'role', value: 'button', name: 'Sign In' },
+        },
+        {
+          thought: 'Conclude login page inspection',
+          action: 'conclude',
+          conclude: { outcome: 'PASS', reasoning: 'All login form controls observed.' },
+        },
+      ];
+
+      const report = await executeAiAgent(
+        {
+          url: `${baseUrl}/login-test-portal`,
+          instructions: 'Inspect the login page layout without credentials',
+          credentials: {}, // Zero credentials provided
+        },
+        {
+          allowLocalForTesting: true,
+          allowMock: true,
+          mockObjectives,
+          mockSteps,
+        }
+      );
+
+      assert.equal(report.status, 'passed');
+      assert.equal(report.failedSteps, 0);
+      assert.equal(report.skippedSteps, 0);
+      assert.equal(report.blockedSteps, 0);
+      assert.ok(report.passedSteps >= 3);
+      assert.match(report.coverageAndLimitations.tested, /Inspect login page/i);
+    });
+
+    it('7. passing an invalid-login rejection test leaves session strictly unauthenticated', async () => {
+      const mockObjectives = [
+        {
+          id: 'obj-invalid',
+          description: 'Verify login rejection with deliberately invalid credentials',
+          targetBehavior: 'Invalid login rejection',
+        },
+        {
+          id: 'obj-private-orders',
+          description: 'Inspect private account orders',
+          targetBehavior: 'View private orders',
+          requiresAuth: true,
+          dependsOn: ['obj-invalid'],
+        },
+      ];
+
+      let invalidObjSteps = 0;
+      const mockSteps = ({ objective }) => {
+        if (objective.id === 'obj-invalid') {
+          invalidObjSteps++;
+          if (invalidObjSteps === 1) {
+            return {
+              thought: 'Submit bad user',
+              action: 'fill',
+              target: { strategy: 'placeholder', value: 'Username' },
+              value: 'wrong_user',
+            };
+          }
+          if (invalidObjSteps === 2) {
+            return {
+              thought: 'Submit bad pass',
+              action: 'fill',
+              target: { strategy: 'placeholder', value: 'Password' },
+              value: 'wrong_pass',
+            };
+          }
+          if (invalidObjSteps === 3) {
+            return {
+              thought: 'Click submit',
+              action: 'click',
+              target: { strategy: 'role', value: 'button', name: 'Sign In' },
+            };
+          }
+          if (invalidObjSteps === 4) {
+            return {
+              thought: 'Assert error message is visible',
+              action: 'assertVisible',
+              target: { strategy: 'text', value: 'Invalid username or password' },
+            };
+          }
+          return {
+            thought: 'Conclude invalid login verified',
+            action: 'conclude',
+            conclude: { outcome: 'PASS', reasoning: 'Rejection verified.' },
+          };
+        }
+      };
+
+      const report = await executeAiAgent(
+        {
+          url: `${baseUrl}/login-test-portal`,
+          instructions: 'Test invalid login rejection, then attempt private orders without credentials',
+          credentials: {}, // Zero credentials provided
+        },
+        {
+          allowLocalForTesting: true,
+          allowMock: true,
+          mockObjectives,
+          mockSteps,
+        }
+      );
+
+      // Objective 1 passed (invalid login rejection)
+      const invalidStep = report.steps.find((s) => s.objectiveId === 'obj-invalid' && s.status === 'PASS');
+      assert.ok(invalidStep);
+
+      // Objective 2 must be SKIPPED because invalid login test did NOT establish authenticated session
+      // and no valid credentials were provided to establish one
+      const orderStep = report.steps.find((s) => s.objectiveId === 'obj-private-orders');
+      assert.ok(orderStep, 'Private orders step must exist');
+      assert.equal(orderStep.status, 'SKIPPED');
+      assert.match(orderStep.actual, /Requires an authenticated session/i);
+    });
+
+    it('8. login objectives are never skipped merely because the active browser session is logged out', () => {
+      const objLogin = {
+        id: 'obj-login-flow',
+        description: 'Verify login functionality with valid and invalid credentials',
+        targetBehavior: 'Authentication verification',
+        preconditions: ['Must be logged in', 'Login credentials'], // Misleading precondition should not block login test
+      };
+
+      // State is unauthenticated (logged out)
+      const checkResult = checkObjectiveDependencies(objLogin, {
+        failedObjectiveIds: new Set(),
+        authFailed: false,
+        authSucceeded: false,
+        credentials: { username: 'testuser', password: 'testpassword' },
+      });
+
+      assert.equal(checkResult.canRun, true, 'Login objective must be executable when currently logged out');
+      assert.equal(checkResult.status, undefined);
+    });
+
+    it('9. continues independent public objectives when valid-login testing is blocked due to missing credentials', async () => {
+      const mockObjectives = [
+        {
+          id: 'obj-valid-login',
+          description: 'Login with valid credentials and verify user profile',
+          targetBehavior: 'Authenticate with valid credentials',
+        },
+        {
+          id: 'obj-independent-calendar',
+          description: 'Check whether the displayed weekday matches the calendar date',
+          targetBehavior: 'Calendar synchronization',
+        },
+      ];
+
+      const mockSteps = ({ objective, stepNumber }) => {
+        if (objective.id === 'obj-independent-calendar') {
+          if (stepNumber <= 3) {
+            return {
+              thought: 'Verify date synchronization independently',
+              action: 'assertDateSync',
+            };
+          }
+          return {
+            thought: 'Conclude calendar check',
+            action: 'conclude',
+            conclude: { outcome: 'PASS', reasoning: 'Calendar verified.' },
+          };
+        }
+      };
+
+      const report = await executeAiAgent(
+        {
+          url: `${baseUrl}/calendar-sync`,
+          instructions: 'Login with valid credentials, and verify calendar synchronization',
+          credentials: {}, // Zero credentials provided -> Objective 1 BLOCKED
+        },
+        {
+          allowLocalForTesting: true,
+          allowMock: true,
+          mockObjectives,
+          mockSteps,
+        }
+      );
+
+      // Objective 1 must be BLOCKED
+      const loginStep = report.steps.find((s) => s.objectiveId === 'obj-valid-login');
+      assert.ok(loginStep, 'Valid login step must exist');
+      assert.equal(loginStep.status, 'BLOCKED');
+
+      // Objective 2 must be PASS
+      const calendarStep = report.steps.find((s) => s.objectiveId === 'obj-independent-calendar');
+      assert.ok(calendarStep, 'Independent calendar step must exist');
+      assert.equal(calendarStep.status, 'PASS');
+
+      // Overall status partial
+      assert.equal(report.status, 'partial');
+      assert.equal(report.blockedSteps, 1);
+      assert.ok(report.passedSteps >= 1);
+      assert.equal(report.skippedSteps, 0);
     });
   });
 

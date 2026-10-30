@@ -591,9 +591,11 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
             }
           } else {
             // Invalid-only login verification passed (access was denied as expected)
-            // Session remains unauthenticated
-            authFailed = false;
+            // or login-page inspection passed (form controls observed)
+            // Session remains strictly unauthenticated
+            authSucceeded = false;
             sessionIsAuthenticated = false;
+            authFailed = false;
           }
         } else {
           authFailed = true;
@@ -986,8 +988,14 @@ export function isLoginVerificationObjective(objective) {
   if (objective.isAuthGate === true) return true;
 
   const text = `${objective.targetBehavior || ''} ${objective.description || ''}`.toLowerCase();
-  const isAuthTerm = /\b(log\s*in|sign\s*in|authenticate|authentication|auth\s*flow|login\s*page)\b/i.test(text);
-  const isTestingTerm = /\b(verify|test|check|attempt|validate|exercise|assert)\b/i.test(text);
+
+  // If the objective is explicitly about recovering/navigating away from login page back to home or catalog
+  if (/\b(recover|return|back\s*to\s*home|navigate\s*away)\b/i.test(text)) {
+    return false;
+  }
+
+  const isAuthTerm = /\b(log[-_\s]*in|sign[-_\s]*in|logging[-_\s]*in|authenticate|authentication|auth[-_\s]*flow|login[-_\s]*page|signin[-_\s]*page)\b/i.test(text);
+  const isTestingTerm = /\b(verify|test|check|attempt|validate|exercise|assert|inspect|observe|view|explore|audit|navigate|reach|open|review|examination|inspection|layout|controls|authenticate|login|sign[-_\s]*in|rejection|denied|error)\b/i.test(text);
 
   return isAuthTerm && (isTestingTerm || text.includes('credential'));
 }
@@ -1006,17 +1014,28 @@ export function requiresValidCredentials(objective) {
 
   const text = `${objective.targetBehavior || ''} ${objective.description || ''} ${objective.expectedOutcome || ''}`.toLowerCase();
   const preconds = Array.isArray(objective.preconditions) ? objective.preconditions.map(String).join(' ').toLowerCase() : '';
+  const combined = `${text} ${preconds}`;
+
+  // If the objective explicitly tests only invalid login (rejection) or inspects login page elements/layout,
+  // it does not require supplied valid credentials
+  const isInvalidOnly =
+    /\b(invalid|wrong|incorrect|bad|fake|rejection|denied)\b/i.test(combined) &&
+    !/\b(valid\s*and\s*invalid|valid\s*&\s*invalid|both\s*valid|and\s*valid|valid\s*login|valid\s*credential)\b/i.test(combined);
+
+  const isInspectionOnly =
+    /\b(inspect|layout|appearance|elements|controls|observe|view|structure)\b/i.test(combined) &&
+    !/\b(valid\s*login|valid\s*credential|submit\s*valid|log\s*in\s*with\s*valid|sign\s*in\s*with\s*valid|successful\s*login)\b/i.test(combined);
+
+  if (isInvalidOnly || isInspectionOnly) {
+    return false;
+  }
 
   // Specifically check for valid credentials requirements
   const specifiesValid =
-    /\b(valid\s*credential|valid\s*login|valid\s*and\s*invalid|valid\s*&\s*invalid|log\s*in\s*with\s*valid|sign\s*in\s*with\s*valid|using\s*valid)\b/i.test(text) ||
+    /\b(valid\s*credential|valid\s*login|valid\s*and\s*invalid|valid\s*&\s*invalid|log\s*in\s*with\s*valid|sign\s*in\s*with\s*valid|using\s*valid|submit\s*valid|successful\s*login|login\s*with\s*valid|sign\s*in\s*with\s*valid|valid\s*user)\b/i.test(combined) ||
     /\b(valid\s*credential|valid\s*login|test\s*credential|account\s*credential)\b/i.test(preconds);
 
-  if (specifiesValid) {
-    return true;
-  }
-
-  return false;
+  return Boolean(specifiesValid);
 }
 
 /**
@@ -1033,7 +1052,7 @@ export function requiresAuthenticatedSession(objective) {
   if (objective.requiresAuth === true) return true;
 
   if (Array.isArray(objective.preconditions)) {
-    return objective.preconditions.some((p) => {
+    const hasAuthPrecondition = objective.preconditions.some((p) => {
       const pLower = String(p).toLowerCase();
       return (
         pLower.includes('logged in') ||
@@ -1045,6 +1064,12 @@ export function requiresAuthenticatedSession(objective) {
         pLower.includes('existing session')
       );
     });
+    if (hasAuthPrecondition) return true;
+  }
+
+  const text = `${objective.targetBehavior || ''} ${objective.description || ''}`.toLowerCase();
+  if (/\b(authenticated\s*(?:session|order|user|area|route|feature|dashboard)|private\s*(?:profile|account|member|order|setting|history))\b/i.test(text)) {
+    return true;
   }
 
   return false;
