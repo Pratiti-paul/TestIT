@@ -1621,7 +1621,7 @@ async function resolveAgentLocator(page, target, timeout, decision = null, conte
 
   const escapeRegex = (str) => String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-  // Disambiguation helper for multiple visible matching candidates
+  // Disambiguation helper for multiple visible matching candidates using generic browser semantics
   const disambiguateCandidates = async (candidateLocators, label, strat) => {
     if (candidateLocators.length === 1) {
       return candidateLocators[0];
@@ -1630,64 +1630,175 @@ async function resolveAgentLocator(page, target, timeout, decision = null, conte
       return null;
     }
 
-    // Multiple visible candidate controls exist.
-    // Collect context clues from decision and objective
-    const contextClues = [
-      decision?.thought,
-      decision?.expectedOutcome,
-      decision?.target?.context,
-      context?.objective?.targetBehavior,
-      context?.objective?.description,
-      context?.objective?.expectedOutcome,
-    ]
-      .filter(Boolean)
-      .join(' ')
-      .toLowerCase();
+    const action = String(decision?.action || '').toLowerCase();
+    const thoughtStr = String(decision?.thought || '').toLowerCase();
+    const targetStr = `${target?.strategy || ''} ${target?.value || ''} ${target?.name || ''}`.toLowerCase();
+    const expectedStr = String(decision?.expectedOutcome || '').toLowerCase();
+    const objBehavior = String(context?.objective?.targetBehavior || '').toLowerCase();
+    const objDesc = String(context?.objective?.description || '').toLowerCase();
+    const combinedIntent = `${thoughtStr} ${targetStr} ${expectedStr} ${objBehavior} ${objDesc}`.toLowerCase();
+
+    // Contextual intent classification using generic semantic tokens
+    const isSubmitIntent =
+      /\b(submit|log[-_\s]*in|sign[-_\s]*in|register|sign[-_\s]*up|create\s*account|confirm|checkout|place\s*order|save|save\s*changes|apply|apply\s*now|book|book\s*now)\b/i.test(
+        combinedIntent
+      );
+    const isNavigationIntent =
+      (/\b(navigat|go\s*to|open|view|visit|link|tab|menu|footer|header|home|browse|explore|portal|page|item\s*details|view\s*cart)\b/i.test(
+        combinedIntent
+      ) ||
+        target?.strategy === 'link' ||
+        target?.value === 'link') &&
+      !isSubmitIntent;
+    const isFillIntent = action === 'fill' || /\b(fill|type|enter|input|write)\b/i.test(combinedIntent);
+    const isSelectIntent = action === 'select' || /\b(select|choose|pick|option|dropdown)\b/i.test(combinedIntent);
 
     const stopWords = new Set([
       'the', 'and', 'for', 'with', 'that', 'this', 'from', 'click', 'button', 'select', 'test', 'verify',
       'page', 'should', 'will', 'have', 'been', 'user', 'action', 'element', 'control', 'role', 'text'
     ]);
-    const keywords = contextClues
+    const keywords = combinedIntent
       .replace(/[^\p{L}\p{N}\s]/gu, ' ')
       .split(/\s+/)
       .filter((w) => w.length >= 3 && !stopWords.has(w));
 
+    // Evaluate semantic profile and container context for each candidate
     const scored = [];
     for (let i = 0; i < candidateLocators.length; i++) {
       const loc = candidateLocators[i];
-      const containerInfo = await loc
+      const meta = await loc
         .evaluate((el) => {
+          const tagName = el.tagName.toLowerCase();
+          const explicitRole = (el.getAttribute('role') || '').toLowerCase();
+          const type = (el.getAttribute('type') || '').toLowerCase();
+          const isHeading = /^h[1-6]$/.test(tagName) || explicitRole === 'heading';
+          const isButton =
+            tagName === 'button' ||
+            explicitRole === 'button' ||
+            type === 'submit' ||
+            type === 'button';
+          const inForm = Boolean(el.form || el.closest('form'));
+          const isSubmitBtn = type === 'submit' || (isButton && inForm);
+          const isLink =
+            tagName === 'a' ||
+            explicitRole === 'link' ||
+            explicitRole === 'tab' ||
+            explicitRole === 'menuitem';
+          const isInput =
+            tagName === 'input' ||
+            tagName === 'textarea' ||
+            explicitRole === 'textbox' ||
+            el.isContentEditable;
+          const isSelect =
+            tagName === 'select' ||
+            explicitRole === 'combobox' ||
+            explicitRole === 'listbox';
+          const isStaticText =
+            ['p', 'span', 'label', 'legend', 'b', 'strong', 'i', 'em', 'small', 'caption'].includes(tagName) &&
+            !explicitRole;
+          const hasClickPointer = window.getComputedStyle(el).cursor === 'pointer';
+          const ariaLabel = (el.getAttribute('aria-label') || el.getAttribute('title') || '').trim();
+
           const container = el.closest(
             'tr, article, section, li, [class*="card" i], [class*="row" i], [class*="item" i], form, fieldset, div'
           );
-          if (!container) return '';
-          return (container.innerText || container.textContent || '').trim().replace(/\s+/g, ' ').toLowerCase();
-        })
-        .catch(() => '');
+          const containerText = container
+            ? (container.innerText || container.textContent || '').trim().replace(/\s+/g, ' ').toLowerCase()
+            : '';
 
-      let score = 0;
-      if (keywords.length > 0 && containerInfo.length > 0) {
+          return {
+            tagName,
+            role: explicitRole,
+            type,
+            isHeading,
+            isButton,
+            isSubmitBtn,
+            isLink,
+            isInput,
+            isSelect,
+            isStaticText,
+            hasClickPointer,
+            inForm,
+            ariaLabel,
+            containerText,
+          };
+        })
+        .catch(() => null);
+
+      if (!meta) continue;
+
+      let semanticScore = 0;
+
+      if (action === 'click') {
+        // Exclude / heavily penalize non-interactive headings and static text for click actions
+        if (meta.isHeading) {
+          semanticScore -= 500;
+        } else if (meta.isStaticText && !meta.hasClickPointer) {
+          semanticScore -= 200;
+        }
+
+        if (isSubmitIntent) {
+          if (meta.isSubmitBtn) semanticScore += 300;
+          else if (meta.isButton) semanticScore += 200;
+          else if (meta.isLink) semanticScore += 60;
+        } else if (isNavigationIntent) {
+          if (meta.isLink) semanticScore += 300;
+          else if (meta.isButton) semanticScore += 120;
+        } else {
+          // General click action: prioritize interactive controls
+          if (meta.isButton) semanticScore += 200;
+          else if (meta.isLink) semanticScore += 180;
+          else if (meta.hasClickPointer) semanticScore += 60;
+        }
+
+        if (meta.ariaLabel) {
+          semanticScore += 20;
+        }
+      } else if (action === 'fill') {
+        if (meta.isInput) semanticScore += 300;
+        else semanticScore -= 500;
+      } else if (action === 'select') {
+        if (meta.isSelect) semanticScore += 300;
+        else semanticScore -= 500;
+      }
+
+      // Container contextual score
+      let containerScore = 0;
+      if (keywords.length > 0 && meta.containerText.length > 0) {
         for (const kw of keywords) {
-          if (containerInfo.includes(kw)) {
-            score++;
+          if (meta.containerText.includes(kw)) {
+            containerScore += 15;
           }
         }
       }
-      scored.push({ loc, score, snippet: containerInfo.slice(0, 80) });
+
+      const totalScore = semanticScore + containerScore;
+
+      scored.push({
+        loc,
+        totalScore,
+        semanticScore,
+        containerScore,
+        meta,
+        snippet: meta.containerText.slice(0, 80),
+      });
     }
 
-    scored.sort((a, b) => b.score - a.score);
+    if (scored.length === 0) return null;
 
-    // If the top scored candidate has a distinct higher score > 0 than the second one:
-    if (scored[0].score > 0 && (scored.length === 1 || scored[0].score > scored[1].score)) {
-      console.log(
-        `[Locator Disambiguation]: Disambiguated "${label}" (score ${scored[0].score}) via container: "${scored[0].snippet}"`
-      );
-      return scored[0].loc;
+    scored.sort((a, b) => b.totalScore - a.totalScore);
+
+    // If top candidate has a strictly higher score than second candidate:
+    if (scored.length === 1 || scored[0].totalScore > scored[1].totalScore) {
+      if (scored[0].totalScore > -100) {
+        console.log(
+          `[Locator Disambiguation]: Selected <${scored[0].meta.tagName}> matching "${label}" (totalScore: ${scored[0].totalScore}, semantic: ${scored[0].semanticScore}, container: ${scored[0].containerScore}).`
+        );
+        return scored[0].loc;
+      }
     }
 
-    // True ambiguity remains: multiple visible identical candidates cannot be uniquely disambiguated
+    // Genuine unresolved ambiguity remains: multiple candidates tied or no valid candidate
     const ambigErr = new Error(
       `Ambiguous controls: Found ${candidateLocators.length} identical visible controls matching "${label}" (strategy: ${strat}). Cannot determine intended target without additional context.`
     );
@@ -1744,23 +1855,53 @@ async function resolveAgentLocator(page, target, timeout, decision = null, conte
   // 1. Primary fast attempt (up to 2500ms or remaining timeout)
   const primaryWaitMs = Math.min(timeout, 2500);
   try {
-    const matchCount = await primaryLocator.count().catch(() => 0);
-    if (matchCount === 1) {
-      const isPrimaryVis = await primaryLocator.first().isVisible({ timeout: primaryWaitMs }).catch(() => false);
-      if (isPrimaryVis) {
-        return primaryLocator.first();
-      }
-    } else if (matchCount > 1) {
-      const visibleCandidates = [];
-      for (let i = 0; i < matchCount; i++) {
-        const item = primaryLocator.nth(i);
-        if (await item.isVisible({ timeout: 400 }).catch(() => false)) {
-          visibleCandidates.push(item);
+    const action = String(decision?.action || '').toLowerCase();
+    const locatorsToInspect = [primaryLocator];
+
+    // For click actions using text strategy, also include accessible interactive controls matching name/aria-label/title
+    if (action === 'click' && strategy === 'text' && value) {
+      const escVal = escapeRegex(value);
+      const safeVal = String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+      locatorsToInspect.push(
+        page.getByRole('button', { name: new RegExp(`^${escVal}$`, 'i') }),
+        page.getByRole('link', { name: new RegExp(`^${escVal}$`, 'i') }),
+        page.locator(
+          `button[aria-label="${safeVal}" i], button[title="${safeVal}" i], a[aria-label="${safeVal}" i], a[title="${safeVal}" i], [role="button"][aria-label="${safeVal}" i], [role="button"][title="${safeVal}" i]`
+        )
+      );
+    }
+
+    const uniqueCandidates = [];
+    const seenDomIds = new Set();
+
+    for (const loc of locatorsToInspect) {
+      const cnt = await loc.count().catch(() => 0);
+      for (let i = 0; i < cnt; i++) {
+        const item = loc.nth(i);
+        const isVis = await item.isVisible({ timeout: 400 }).catch(() => false);
+        if (!isVis) continue;
+        const domId = await item
+          .evaluate((el) => {
+            if (!el.__testit_cand_id) {
+              el.__testit_cand_id = Math.random().toString(36).slice(2);
+            }
+            return el.__testit_cand_id;
+          })
+          .catch(() => null);
+        if (domId && !seenDomIds.has(domId)) {
+          seenDomIds.add(domId);
+          uniqueCandidates.push(item);
         }
       }
-      if (visibleCandidates.length > 0) {
-        return await disambiguateCandidates(visibleCandidates, name || value, strategy);
+    }
+
+    if (uniqueCandidates.length === 1) {
+      const isPrimaryVis = await uniqueCandidates[0].isVisible({ timeout: primaryWaitMs }).catch(() => false);
+      if (isPrimaryVis) {
+        return uniqueCandidates[0];
       }
+    } else if (uniqueCandidates.length > 1) {
+      return await disambiguateCandidates(uniqueCandidates, name || value, strategy);
     }
   } catch (err) {
     if (err.isAmbiguous) throw err;
