@@ -63,7 +63,10 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
     plannedObjectives = plan.objectives || [];
   } catch (err) {
     // If objective planning fails, wrap in structured error report with sanitized errors
-    const sanitizedError = sanitizeErrorString(err.message, [provider.apiKey]);
+    const sanitizedError = sanitizeErrorString(
+      err.message,
+      [provider.apiKey, credentials?.password, credentials?.username].filter(Boolean)
+    );
     const hypothesis =
       err.category === 'authentication_error'
         ? 'Check that the configured AI provider API key is valid and has appropriate permissions.'
@@ -358,7 +361,10 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
             maxSteps,
           });
         } catch (planErr) {
-          const sanitizedError = sanitizeErrorString(planErr.message, [provider.apiKey]);
+          const sanitizedError = sanitizeErrorString(
+            planErr.message,
+            [provider.apiKey, credentials?.password, credentials?.username].filter(Boolean)
+          );
           const hypothesis =
             planErr.category === 'rate_limit_error'
               ? 'Rate limit exceeded during step decision.'
@@ -779,50 +785,78 @@ async function executeAgentAction(page, decision, timeout, context) {
 
     case 'fill': {
       const locator = await resolveAgentLocator(page, target, timeout);
+
+      // Domain-agnostic field attribute & type discovery via target descriptors and DOM element attributes
+      const targetStr = `${target?.strategy || ''} ${target?.value || ''} ${target?.name || ''}`.toLowerCase();
+      const elemType = (await locator.getAttribute('type').catch(() => ''))?.toLowerCase() || '';
+      const elemName = (await locator.getAttribute('name').catch(() => ''))?.toLowerCase() || '';
+      const elemPlaceholder = (await locator.getAttribute('placeholder').catch(() => ''))?.toLowerCase() || '';
+      const elemAriaLabel = (await locator.getAttribute('aria-label').catch(() => ''))?.toLowerCase() || '';
+      const elemAutocomplete = (await locator.getAttribute('autocomplete').catch(() => ''))?.toLowerCase() || '';
+      const elemId = (await locator.getAttribute('id').catch(() => ''))?.toLowerCase() || '';
+
       const isPassword =
-        target.value.toLowerCase().includes('password') ||
-        (target.name && target.name.toLowerCase().includes('password')) ||
-        (target.strategy === 'role' && target.value === 'textbox' && target.name && target.name.toLowerCase().includes('password'));
+        elemType === 'password' ||
+        targetStr.includes('password') ||
+        elemName.includes('password') ||
+        elemPlaceholder.includes('password') ||
+        elemId.includes('password') ||
+        elemAutocomplete.includes('password');
+
+      const isUsername =
+        !isPassword &&
+        (
+          elemType === 'email' ||
+          elemAutocomplete === 'username' ||
+          elemAutocomplete === 'email' ||
+          /\b(username|email|user|login|identifier|account)\b/i.test(elemName) ||
+          /\b(username|email|user|login|identifier|account)\b/i.test(elemPlaceholder) ||
+          /\b(username|email|user|login|identifier|account)\b/i.test(elemAriaLabel) ||
+          /\b(username|email|user|login|identifier|account)\b/i.test(elemId) ||
+          /\b(username|email|user|login|identifier|account)\b/i.test(targetStr)
+        );
 
       const rawVal = String(value !== undefined && value !== null ? value : '');
-      const isDeliberateInvalidPassword =
-        isPassword &&
-        rawVal &&
-        (
-          /invalid|wrong|incorrect|bad|fake|test_wrong|fail/i.test(rawVal) ||
-          (context.credentials?.password && rawVal !== context.credentials.password && rawVal !== '••••••••' && rawVal !== '[VALID_PASSWORD]')
-        );
+      const thoughtStr = String(action?.thought || '').toLowerCase();
+      const objBehavior = String(context.objective?.targetBehavior || '').toLowerCase();
+      const objDesc = String(context.objective?.description || '').toLowerCase();
+
+      // Detect deliberate invalid credential testing
+      const isDeliberateInvalidValue =
+        Boolean(rawVal) &&
+        /invalid|wrong|incorrect|bad|fake|test_wrong|fail|dummy|nonexistent/i.test(rawVal);
+
+      const isDeliberateInvalidIntent =
+        isDeliberateInvalidValue ||
+        /\b(invalid|wrong|incorrect|bad|fake)\b.*(user|email|pass|cred|login)/i.test(thoughtStr) ||
+        /\b(verify|test|assert|check)\b.*(denied|rejection|failed.*login|invalid.*login)/i.test(thoughtStr) ||
+        (/\b(invalid\s*login|invalid\s*cred|wrong\s*cred|test\s*invalid)\b/i.test(objBehavior) && !/valid\s*and\s*invalid/i.test(objBehavior)) ||
+        (/\b(invalid\s*login|invalid\s*cred|wrong\s*cred|test\s*invalid)\b/i.test(objDesc) && !/valid\s*and\s*invalid/i.test(objDesc));
 
       let textToFill;
       let displayValue;
 
       if (isPassword) {
-        if (isDeliberateInvalidPassword) {
-          textToFill = rawVal;
+        if (isDeliberateInvalidIntent) {
+          textToFill = rawVal || 'wrong_password';
           displayValue = '•••••••• (invalid test password)';
         } else {
+          // Exact preservation: AI model must NEVER overwrite, truncate or regenerate supplied password
           textToFill = context.credentials?.password || rawVal;
           displayValue = '••••••••';
         }
-      } else {
-        const isUsername =
-          target.value.toLowerCase().includes('user') ||
-          target.value.toLowerCase().includes('email') ||
-          target.value.toLowerCase().includes('login') ||
-          (target.name && /user|email|login/i.test(target.name));
-
-        const isDeliberateInvalidUsername =
-          isUsername &&
-          rawVal &&
-          /invalid|wrong|incorrect|bad|fake|test_wrong|fail/i.test(rawVal);
-
-        if (isUsername && !isDeliberateInvalidUsername && context.credentials?.username && (!rawVal || rawVal === '[VALID_USERNAME]')) {
-          textToFill = context.credentials.username;
-          displayValue = `"${context.credentials.username}"`;
+      } else if (isUsername) {
+        if (isDeliberateInvalidIntent) {
+          textToFill = rawVal || 'invalid_user@example.com';
+          displayValue = `"${textToFill}"`;
         } else {
-          textToFill = rawVal;
-          displayValue = `"${rawVal}"`;
+          // Exact preservation: AI model must NEVER overwrite, truncate or regenerate supplied username/email
+          textToFill = context.credentials?.username ? context.credentials.username : rawVal;
+          displayValue = `"${textToFill}"`;
         }
+      } else {
+        textToFill = rawVal;
+        displayValue = `"${rawVal}"`;
       }
 
       await locator.fill(textToFill, { timeout });

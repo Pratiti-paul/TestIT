@@ -7,6 +7,7 @@ import {
   ProviderError,
   createProviderHttpError,
   wrapProviderError,
+  redactSecrets,
 } from './providerSanitizer.js';
 
 export class GeminiProvider {
@@ -203,7 +204,7 @@ Decision Rules:
 - Prioritize accessible roles, labels, and text over raw CSS classes.
 - If the objective requires verifying date/day synchronization and the page displays a calendar or day ribbon, choose "assertDateSync".
 - If testing invalid login: Fill username and password with deliberately invalid values (e.g., "invalid_user", "wrong_password"), submit, and verify that access is denied (error message, alert, or remaining on login page).
-- When testing valid login: Fill the login form with provided test credentials and submit.
+- When testing valid login: Identify the username/email and password fields to fill. You do not possess the user's secret credentials. For the username/email field, set value to "[VALID_USERNAME]" (or leave blank ""). For the password field, set value to "[VALID_PASSWORD]" (or leave blank ""). The test runner injects the exact user-provided credentials directly into the browser. Never generate or rewrite user-provided credentials.
 - When testing both valid and invalid login: First test invalid credentials and verify denial, then submit valid credentials to establish the authenticated session.
 - If the current objective requires an authenticated session and the page is currently unauthenticated or on a login page, perform login using the available valid credentials to establish the authenticated session before proceeding with the objective.
 - If a page requires login but no credentials are provided in the environment, conclude with "BLOCKED".
@@ -229,12 +230,13 @@ Return ONLY valid JSON matching this schema:
   }
 }`;
 
-    // Mask any secrets in credentials
+    // Indicate credential availability only; never expose credential text, fragments, or hints in prompts
     const safeCreds = {
       hasUsername: Boolean(credentials?.username),
-      usernameHint: credentials?.username ? credentials.username.replace(/^(.)(.*)(@.*)$/, '$1***$3') : null,
       hasPassword: Boolean(credentials?.password),
     };
+
+    const secretsToRedact = [credentials?.password, credentials?.username].filter(Boolean);
 
     const promptContext = {
       objective,
@@ -246,15 +248,15 @@ Return ONLY valid JSON matching this schema:
         interactiveElements: (observation.interactiveElements || []).slice(0, 30),
         activeControls: observation.activeControls || [],
         headings: (observation.headings || []).slice(0, 10),
-        visibleTextSnippet: (observation.visibleTextSnippet || '').slice(0, 1500),
+        visibleTextSnippet: redactSecrets((observation.visibleTextSnippet || '').slice(0, 1500), secretsToRedact),
         consoleErrors: observation.consoleErrors || [],
       },
       actionHistory: history.map((h) => ({
         step: h.stepIndex,
         action: h.action,
-        description: h.description,
+        description: redactSecrets(h.description, secretsToRedact),
         status: h.status,
-        actual: h.actual,
+        actual: redactSecrets(h.actual, secretsToRedact),
       })),
       credentialsProvided: safeCreds,
     };

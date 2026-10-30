@@ -93,10 +93,13 @@ export const runAiTestEndpoint = async (req, res) => {
       });
     }
 
-    console.error('Unhandled AI test runner error:', err);
+    const safeErrorMsg = req.body?.credentials?.password
+      ? (err.message || '').split(req.body.credentials.password).join('[REDACTED]')
+      : err.message;
+    console.error('Unhandled AI test runner error:', safeErrorMsg);
     return res.status(500).json({
       success: false,
-      message: err.message || 'An unexpected error occurred during AI test execution.',
+      message: safeErrorMsg || 'An unexpected error occurred during AI test execution.',
       code: 'INTERNAL_RUNNER_ERROR',
     });
   }

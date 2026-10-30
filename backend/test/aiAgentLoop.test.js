@@ -1290,4 +1290,172 @@ describe('Autonomous AI QA Agent Suite', () => {
       assert.equal(calendarStep.status, 'PASS');
     });
   });
+
+  describe('5. Credential Integrity & Exact Preservation', () => {
+    it('1. preserves exact user-supplied email (abc@gmail.com) when AI model returns a truncated or hallucinated value (a@gmail.com)', async () => {
+      const mockObjectives = [
+        {
+          id: 'obj-login-exact',
+          description: 'Login with user credentials',
+          targetBehavior: 'Authenticate with valid credentials',
+        },
+      ];
+
+      const mockSteps = [
+        {
+          thought: 'Fill email field with user credential',
+          action: 'fill',
+          target: { strategy: 'placeholder', value: 'Username' },
+          value: 'a@gmail.com', // Truncated/hallucinated value from AI model
+        },
+        {
+          thought: 'Fill password field',
+          action: 'fill',
+          target: { strategy: 'placeholder', value: 'Password' },
+          value: '[VALID_PASSWORD]',
+        },
+        {
+          thought: 'Submit login',
+          action: 'click',
+          target: { strategy: 'role', value: 'button', name: 'Sign In' },
+        },
+        {
+          thought: 'Conclude login test',
+          action: 'conclude',
+          conclude: { outcome: 'PASS', reasoning: 'Login successfully verified.' },
+        },
+      ];
+
+      const report = await executeAiAgent(
+        {
+          url: `${baseUrl}/login-test-portal`,
+          instructions: 'Login to portal with test credentials',
+          credentials: { username: 'abc@gmail.com', password: 'validpass123' },
+        },
+        {
+          allowLocalForTesting: true,
+          allowMock: true,
+          mockObjectives,
+          mockSteps,
+        }
+      );
+
+      assert.equal(report.status, 'passed');
+      const emailStep = report.steps.find((s) => s.action === 'fill' && s.description.includes('email'));
+      assert.ok(emailStep, 'Email fill step must exist');
+      // Step actual MUST reflect exact user-supplied email, NOT the model-hallucinated 'a@gmail.com'
+      assert.equal(emailStep.actual, 'Filled input with "abc@gmail.com"');
+    });
+
+    it('2. preserves exact user-supplied password and safely masks it as •••••••• in reports', async () => {
+      const mockObjectives = [
+        {
+          id: 'obj-login-pass',
+          description: 'Login with user credentials',
+          targetBehavior: 'Authenticate with valid credentials',
+        },
+      ];
+
+      const mockSteps = [
+        {
+          thought: 'Fill password field with user credential',
+          action: 'fill',
+          target: { strategy: 'placeholder', value: 'Password' },
+          value: '••••••••',
+        },
+        {
+          thought: 'Conclude login test',
+          action: 'conclude',
+          conclude: { outcome: 'PASS', reasoning: 'Password filled.' },
+        },
+      ];
+
+      const report = await executeAiAgent(
+        {
+          url: `${baseUrl}/login-test-portal`,
+          instructions: 'Login with test credentials',
+          credentials: { username: 'abc@gmail.com', password: 'SuperSecret123!@#' },
+        },
+        {
+          allowLocalForTesting: true,
+          allowMock: true,
+          mockObjectives,
+          mockSteps,
+        }
+      );
+
+      assert.equal(report.status, 'passed');
+      const passStep = report.steps.find((s) => s.action === 'fill' && s.description.includes('password'));
+      assert.ok(passStep, 'Password fill step must exist');
+      assert.equal(passStep.actual, 'Filled input with ••••••••');
+      // Verify raw password never appears in any step description or actual output
+      for (const step of report.steps) {
+        assert.ok(!JSON.stringify(step).includes('SuperSecret123!@#'), 'Password must never appear in report steps');
+      }
+    });
+
+    it('3. preserves deliberately invalid username and password during invalid-login testing', async () => {
+      const mockObjectives = [
+        {
+          id: 'obj-invalid-cred',
+          description: 'Verify login rejection with deliberately invalid credentials',
+          targetBehavior: 'Invalid login rejection',
+        },
+      ];
+
+      const mockSteps = [
+        {
+          thought: 'Fill deliberately invalid username to test rejection',
+          action: 'fill',
+          target: { strategy: 'placeholder', value: 'Username' },
+          value: 'deliberately_invalid_user@example.com',
+        },
+        {
+          thought: 'Fill deliberately invalid password to test rejection',
+          action: 'fill',
+          target: { strategy: 'placeholder', value: 'Password' },
+          value: 'wrong_password_999',
+        },
+        {
+          thought: 'Click submit',
+          action: 'click',
+          target: { strategy: 'role', value: 'button', name: 'Sign In' },
+        },
+        {
+          thought: 'Assert error message is visible',
+          action: 'assertVisible',
+          target: { strategy: 'text', value: 'Invalid username or password' },
+        },
+        {
+          thought: 'Conclude invalid login test',
+          action: 'conclude',
+          conclude: { outcome: 'PASS', reasoning: 'Rejection verified.' },
+        },
+      ];
+
+      const report = await executeAiAgent(
+        {
+          url: `${baseUrl}/login-test-portal`,
+          instructions: 'Test invalid login rejection',
+          credentials: { username: 'abc@gmail.com', password: 'validpass123' },
+        },
+        {
+          allowLocalForTesting: true,
+          allowMock: true,
+          mockObjectives,
+          mockSteps,
+        }
+      );
+
+      assert.equal(report.status, 'passed');
+      const userStep = report.steps.find((s) => s.action === 'fill' && s.description.includes('username'));
+      assert.ok(userStep);
+      // Deliberate invalid username must be preserved and filled, NOT replaced with 'abc@gmail.com'
+      assert.equal(userStep.actual, 'Filled input with "deliberately_invalid_user@example.com"');
+
+      const passStep = report.steps.find((s) => s.action === 'fill' && s.description.includes('password'));
+      assert.ok(passStep);
+      assert.equal(passStep.actual, 'Filled input with •••••••• (invalid test password)');
+    });
+  });
 });

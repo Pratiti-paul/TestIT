@@ -132,6 +132,109 @@ describe('AI Provider Request Security, Reliability & Sanitization Suite', () =>
       assert.equal(interceptedHeaders['x-goog-api-key'], SYNTHETIC_SECRET);
       assert.equal(decision.action, 'conclude');
     });
+
+    it('ensures decideNextStep does not leak usernameHint or sensitive credentials into request payload', async () => {
+      let interceptedBody = null;
+
+      globalThis.fetch = async (url, options) => {
+        interceptedBody = JSON.parse(options.body);
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            candidates: [
+              {
+                content: {
+                  parts: [
+                    {
+                      text: JSON.stringify({
+                        thought: 'Conclude step',
+                        action: 'conclude',
+                        conclude: { outcome: 'PASS', reasoning: 'Done' },
+                      }),
+                    },
+                  ],
+                },
+              },
+            ],
+          }),
+        };
+      };
+
+      const provider = new GeminiProvider(SYNTHETIC_SECRET, 'gemini-2.5-flash');
+      await provider.decideNextStep({
+        objective: { id: 'obj-1', description: 'Test login' },
+        observation: {
+          url: 'https://example.com',
+          title: 'Example',
+          visibleTextSnippet: 'Welcome to our site, abc@gmail.com',
+        },
+        history: [
+          {
+            stepIndex: 1,
+            action: 'fill',
+            description: 'Filled input with "abc@gmail.com"',
+            status: 'PASS',
+            actual: 'Filled input with "abc@gmail.com"',
+          },
+        ],
+        credentials: { username: 'abc@gmail.com', password: 'SecretPassword123!' },
+      });
+
+      const bodyStr = JSON.stringify(interceptedBody);
+      assert.ok(!bodyStr.includes('usernameHint'), 'Body must not contain usernameHint');
+      assert.ok(!bodyStr.includes('a***@gmail.com'), 'Body must not contain masked usernameHint');
+      assert.ok(!bodyStr.includes('abc@gmail.com'), 'Body must not contain user email');
+      assert.ok(!bodyStr.includes('SecretPassword123!'), 'Body must not contain user password');
+    });
+
+    it('ensures OpenAI decideNextStep redacts sensitive credentials from history and snippet', async () => {
+      let interceptedBody = null;
+
+      globalThis.fetch = async (url, options) => {
+        interceptedBody = JSON.parse(options.body);
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            choices: [
+              {
+                message: {
+                  content: JSON.stringify({
+                    thought: 'Conclude step',
+                    action: 'conclude',
+                    conclude: { outcome: 'PASS', reasoning: 'Done' },
+                  }),
+                },
+              },
+            ],
+          }),
+        };
+      };
+
+      const provider = new OpenAiProvider('test-openai-key', 'gpt-4o-mini');
+      await provider.decideNextStep({
+        objective: { id: 'obj-1', description: 'Test login' },
+        observation: {
+          url: 'https://example.com',
+          title: 'Example',
+          visibleTextSnippet: 'User profile: abc@gmail.com',
+        },
+        history: [
+          {
+            stepIndex: 1,
+            action: 'fill',
+            status: 'PASS',
+            actual: 'Filled input with "abc@gmail.com"',
+          },
+        ],
+        credentials: { username: 'abc@gmail.com', password: 'SecretPassword123!' },
+      });
+
+      const bodyStr = JSON.stringify(interceptedBody);
+      assert.ok(!bodyStr.includes('abc@gmail.com'), 'OpenAI payload must not contain user email');
+      assert.ok(!bodyStr.includes('SecretPassword123!'), 'OpenAI payload must not contain user password');
+    });
   });
 
   describe('2. Bounded Provider Request Timeouts', () => {

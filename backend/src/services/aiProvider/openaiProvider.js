@@ -7,6 +7,7 @@ import {
   ProviderError,
   createProviderHttpError,
   wrapProviderError,
+  redactSecrets,
 } from './providerSanitizer.js';
 
 export class OpenAiProvider {
@@ -143,7 +144,7 @@ Requirements:
 Based on the live page observation and action history, select the next single Playwright action or conclude.
 Rules:
 - For invalid login testing: Fill deliberately invalid credentials (e.g. "invalid_user", "wrong_password"), submit, and verify access rejection.
-- For valid login testing: Fill provided credentials and submit.
+- For valid login testing: Identify the username/email and password fields to fill. You do not possess the user's secret credentials. For the username/email field, set value to "[VALID_USERNAME]" (or empty string ""). For the password field, set value to "[VALID_PASSWORD]" (or empty string ""). The execution runner injects the exact user-provided credentials directly into the browser. Never generate or rewrite user-provided credentials.
 - If testing both valid and invalid login: Test invalid credentials first, then valid credentials to leave the session authenticated.
 - If the current objective requires an authenticated session and the page is on a login form, log in with valid credentials first.
 - If credentials are required but none provided, conclude BLOCKED.
@@ -157,6 +158,8 @@ Return JSON with:
   "conclude"?: { "outcome": "PASS"|"FAIL"|"BLOCKED"|"NEEDS_CLARIFICATION", "reasoning": string, "failureAnalysis"?: { "description": string, "stepsToReproduce": string[], "hypothesis": string } }
 }`;
 
+    const secretsToRedact = [credentials?.password, credentials?.username].filter(Boolean);
+
     const promptContext = {
       objective,
       currentStep: stepNumber,
@@ -167,14 +170,14 @@ Return JSON with:
         interactiveElements: (observation.interactiveElements || []).slice(0, 30),
         activeControls: observation.activeControls || [],
         headings: (observation.headings || []).slice(0, 10),
-        visibleTextSnippet: (observation.visibleTextSnippet || '').slice(0, 1500),
+        visibleTextSnippet: redactSecrets((observation.visibleTextSnippet || '').slice(0, 1500), secretsToRedact),
         consoleErrors: observation.consoleErrors || [],
       },
       actionHistory: history.map((h) => ({
         step: h.stepIndex,
         action: h.action,
         status: h.status,
-        actual: h.actual,
+        actual: redactSecrets(h.actual, secretsToRedact),
       })),
       hasCredentials: Boolean(credentials?.username),
     };
