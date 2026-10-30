@@ -1,7 +1,13 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { executeAiAgent } from '../src/services/aiAgentService.js';
+import {
+  executeAiAgent,
+  checkObjectiveDependencies,
+  isLoginVerificationObjective,
+  requiresValidCredentials,
+  requiresAuthenticatedSession,
+} from '../src/services/aiAgentService.js';
 import { verifyDateAndWeekdaySync, extractDateTokens } from '../src/services/verifiers/dateVerifier.js';
 import { verifyCalculation, verifySorting } from '../src/services/verifiers/calculationVerifier.js';
 import { validateAgentDecision, getMissingProviderReport } from '../src/services/aiProvider/index.js';
@@ -157,6 +163,47 @@ describe('Autonomous AI QA Agent Suite', () => {
                   <button type="submit">Sign In</button>
                 </form>
               </div>
+            </body>
+          </html>
+        `);
+      } else if (url.pathname === '/login-test-portal') {
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end(`
+          <!DOCTYPE html>
+          <html>
+            <head><title>Portal Login</title></head>
+            <body>
+              <h2>Account Login</h2>
+              <form id="login-form" onsubmit="handleAuth(event)">
+                <input id="username" name="user" placeholder="Username" required />
+                <input id="password" name="pass" type="password" placeholder="Password" required />
+                <button type="submit" id="login-btn">Sign In</button>
+              </form>
+              <div id="error-msg" style="display:none; color:red;">Invalid username or password</div>
+              <div id="user-dashboard" style="display:none;">
+                <h3>Welcome, Member!</h3>
+                <p id="user-display"></p>
+                <a href="#orders" id="view-orders">My Order History</a>
+              </div>
+              <script>
+                function handleAuth(e) {
+                  e.preventDefault();
+                  const u = document.getElementById('username').value.trim();
+                  const p = document.getElementById('password').value;
+                  const err = document.getElementById('error-msg');
+                  const dash = document.getElementById('user-dashboard');
+                  err.style.display = 'none';
+
+                  if (u === 'validuser' && p === 'validpass123') {
+                    document.getElementById('login-form').style.display = 'none';
+                    document.getElementById('user-display').textContent = 'Logged in as ' + u;
+                    dash.style.display = 'block';
+                    localStorage.setItem('auth_token', 'valid_token_789');
+                  } else {
+                    err.style.display = 'block';
+                  }
+                }
+              </script>
             </body>
           </html>
         `);
@@ -800,6 +847,447 @@ describe('Autonomous AI QA Agent Suite', () => {
       assert.equal(report.blockedSteps, 1);
       assert.ok(report.passedSteps >= 1);
       assert.equal(report.failedSteps, 0);
+    });
+  });
+
+  describe('4. Authentication Prerequisites, Login Verification & Session Restoration', () => {
+    it('accurately classifies login-testing objectives and distinguishes them from authenticated objectives', () => {
+      // Login verification objectives (must NOT require existing session)
+      const objLoginValid = {
+        id: 'obj-1',
+        description: 'Test the login page with valid and invalid credentials',
+        targetBehavior: 'Verify login functionality with valid and invalid credentials',
+        preconditions: ['Login credentials', 'Login page accessible'],
+      };
+      assert.equal(isLoginVerificationObjective(objLoginValid), true);
+      assert.equal(requiresValidCredentials(objLoginValid), true);
+      assert.equal(requiresAuthenticatedSession(objLoginValid), false);
+
+      const objLoginInvalidOnly = {
+        id: 'obj-2',
+        description: 'Verify login rejection with deliberately invalid credentials',
+        targetBehavior: 'Attempt invalid login and verify error message',
+        expectedOutcome: 'Observable error displayed and access denied',
+      };
+      assert.equal(isLoginVerificationObjective(objLoginInvalidOnly), true);
+      assert.equal(requiresValidCredentials(objLoginInvalidOnly), false);
+      assert.equal(requiresAuthenticatedSession(objLoginInvalidOnly), false);
+
+      // Authenticated non-login objectives (strictly require active session)
+      const objProfile = {
+        id: 'obj-3',
+        description: 'Inspect private user account order history',
+        targetBehavior: 'View authenticated orders',
+        requiresAuth: true,
+      };
+      assert.equal(isLoginVerificationObjective(objProfile), false);
+      assert.equal(requiresAuthenticatedSession(objProfile), true);
+
+      // Independent public objectives (neither login nor requiring auth)
+      const objSearch = {
+        id: 'obj-4',
+        description: 'Search for Paracetamol and add first result to cart',
+        targetBehavior: 'Search and cart operations',
+        preconditions: ['Catalog page'],
+      };
+      assert.equal(isLoginVerificationObjective(objSearch), false);
+      assert.equal(requiresAuthenticatedSession(objSearch), false);
+    });
+
+    it('1. executes a login-verification objective without requiring an existing authenticated session', async () => {
+      const mockObjectives = [
+        {
+          id: 'obj-login',
+          description: 'Test login page with valid and invalid credentials',
+          targetBehavior: 'Verify login functionality with valid and invalid credentials',
+          preconditions: ['Login credentials'],
+        },
+      ];
+
+      // Dependency check must allow running without existing authenticated session
+      const checkResult = checkObjectiveDependencies(mockObjectives[0], {
+        failedObjectiveIds: new Set(),
+        authFailed: false,
+        authSucceeded: false,
+        credentials: { username: 'validuser', password: 'validpass123' },
+      });
+      assert.equal(checkResult.canRun, true, 'Login verification objective must be executable without prior session');
+
+      const mockSteps = [
+        {
+          thought: 'Fill username',
+          action: 'fill',
+          target: { strategy: 'placeholder', value: 'Username' },
+          value: 'validuser',
+        },
+        {
+          thought: 'Fill password',
+          action: 'fill',
+          target: { strategy: 'placeholder', value: 'Password' },
+          value: 'validpass123',
+        },
+        {
+          thought: 'Click sign in',
+          action: 'click',
+          target: { strategy: 'role', value: 'button', name: 'Sign In' },
+        },
+        {
+          thought: 'Conclude login test',
+          action: 'conclude',
+          conclude: { outcome: 'PASS', reasoning: 'Login successfully verified.' },
+        },
+      ];
+
+      const report = await executeAiAgent(
+        {
+          url: `${baseUrl}/login-test-portal`,
+          instructions: 'Test login page with valid and invalid credentials',
+          credentials: { username: 'validuser', password: 'validpass123' },
+        },
+        {
+          allowLocalForTesting: true,
+          allowMock: true,
+          mockObjectives,
+          mockSteps,
+        }
+      );
+
+      assert.equal(report.status, 'passed');
+      assert.equal(report.skippedSteps, 0);
+      assert.equal(report.passedSteps >= 1, true);
+      const loginSteps = report.steps.filter((s) => s.objectiveId === 'obj-login');
+      assert.ok(loginSteps.length > 0, 'Login objective steps must be executed');
+      assert.ok(loginSteps.every((s) => s.status === 'PASS'), 'All login objective steps must have status PASS');
+      assert.match(report.coverageAndLimitations.tested, /login/i);
+    });
+
+    it('2. marks only the affected login objective as BLOCKED when valid credentials are missing', async () => {
+      const mockObjectives = [
+        {
+          id: 'obj-login-valid',
+          description: 'Verify login functionality with valid and invalid credentials',
+          targetBehavior: 'Test login with valid credentials',
+        },
+      ];
+
+      // Missing credentials check directly
+      const checkResult = checkObjectiveDependencies(mockObjectives[0], {
+        failedObjectiveIds: new Set(),
+        authFailed: false,
+        authSucceeded: false,
+        credentials: {},
+      });
+      assert.equal(checkResult.canRun, false);
+      assert.equal(checkResult.status, 'BLOCKED');
+      assert.match(checkResult.reason, /Blocked: Testing valid login requires test credentials/i);
+      assert.doesNotMatch(checkResult.reason, /Requires an authenticated session/i);
+
+      const report = await executeAiAgent(
+        {
+          url: `${baseUrl}/login-test-portal`,
+          instructions: 'Test login page with valid credentials',
+          credentials: {}, // missing credentials!
+        },
+        {
+          allowLocalForTesting: true,
+          allowMock: true,
+          mockObjectives,
+          mockSteps: [],
+        }
+      );
+
+      assert.equal(report.status, 'blocked');
+      assert.equal(report.blockedSteps, 1);
+      assert.equal(report.skippedSteps, 0);
+      const blockedStep = report.steps.find((s) => s.objectiveId === 'obj-login-valid');
+      assert.ok(blockedStep);
+      assert.equal(blockedStep.status, 'BLOCKED');
+      assert.equal(blockedStep.action, 'blocked');
+      assert.match(blockedStep.actual, /Blocked: Testing valid login requires test credentials/i);
+    });
+
+    it('3. executes invalid login testing with deliberately invalid credentials and verifies rejection', async () => {
+      const mockObjectives = [
+        {
+          id: 'obj-invalid-login',
+          description: 'Test invalid login rejection',
+          targetBehavior: 'Attempt invalid login and verify error message',
+          expectedOutcome: 'Error alert displayed and access denied',
+        },
+      ];
+
+      // Invalid login does NOT require valid credentials
+      const checkResult = checkObjectiveDependencies(mockObjectives[0], {
+        failedObjectiveIds: new Set(),
+        authFailed: false,
+        authSucceeded: false,
+        credentials: {},
+      });
+      assert.equal(checkResult.canRun, true, 'Invalid login test does not require valid credentials');
+
+      const mockSteps = [
+        {
+          thought: 'Fill invalid username',
+          action: 'fill',
+          target: { strategy: 'placeholder', value: 'Username' },
+          value: 'deliberately_invalid_user',
+        },
+        {
+          thought: 'Fill invalid password',
+          action: 'fill',
+          target: { strategy: 'placeholder', value: 'Password' },
+          value: 'wrong_password_test',
+        },
+        {
+          thought: 'Submit invalid credentials',
+          action: 'click',
+          target: { strategy: 'role', value: 'button', name: 'Sign In' },
+        },
+        {
+          thought: 'Assert error message is visible',
+          action: 'assertVisible',
+          target: { strategy: 'text', value: 'Invalid username or password' },
+        },
+        {
+          thought: 'Conclude invalid login verified',
+          action: 'conclude',
+          conclude: { outcome: 'PASS', reasoning: 'Access correctly denied with error message.' },
+        },
+      ];
+
+      const report = await executeAiAgent(
+        {
+          url: `${baseUrl}/login-test-portal`,
+          instructions: 'Test invalid login rejection',
+          credentials: {},
+        },
+        {
+          allowLocalForTesting: true,
+          allowMock: true,
+          mockObjectives,
+          mockSteps,
+        }
+      );
+
+      assert.equal(report.status, 'passed');
+      assert.equal(report.failedSteps, 0);
+      assert.equal(report.skippedSteps, 0);
+      const assertErrStep = report.steps.find((s) => s.action === 'assertVisible');
+      assert.ok(assertErrStep);
+      assert.equal(assertErrStep.status, 'PASS');
+      assert.match(assertErrStep.actual, /visible/i);
+    });
+
+    it('4. executes successful login followed by an authenticated objective and restores session', async () => {
+      const mockObjectives = [
+        {
+          id: 'obj-1-login',
+          description: 'Verify login functionality with valid and invalid credentials',
+          targetBehavior: 'Test login with credentials',
+        },
+        {
+          id: 'obj-2-orders',
+          description: 'Inspect private member order history',
+          targetBehavior: 'View authenticated order history',
+          requiresAuth: true,
+          dependsOn: ['obj-1-login'],
+        },
+      ];
+
+      let obj1Call = 0;
+      let obj2Call = 0;
+      const mockSteps = ({ objective }) => {
+        if (objective.id === 'obj-1-login') {
+          obj1Call++;
+          if (obj1Call === 1) {
+            return {
+              thought: 'Test invalid username',
+              action: 'fill',
+              target: { strategy: 'placeholder', value: 'Username' },
+              value: 'wrong_user',
+            };
+          }
+          if (obj1Call === 2) {
+            return {
+              thought: 'Test invalid password',
+              action: 'fill',
+              target: { strategy: 'placeholder', value: 'Password' },
+              value: 'wrong_pass',
+            };
+          }
+          if (obj1Call === 3) {
+            return {
+              thought: 'Click submit for invalid login',
+              action: 'click',
+              target: { strategy: 'role', value: 'button', name: 'Sign In' },
+            };
+          }
+          if (obj1Call === 4) {
+            return {
+              thought: 'Assert error message',
+              action: 'assertVisible',
+              target: { strategy: 'text', value: 'Invalid username or password' },
+            };
+          }
+          // Now enter valid credentials
+          if (obj1Call === 5) {
+            return {
+              thought: 'Enter valid username',
+              action: 'fill',
+              target: { strategy: 'placeholder', value: 'Username' },
+              value: 'validuser',
+            };
+          }
+          if (obj1Call === 6) {
+            return {
+              thought: 'Enter valid password',
+              action: 'fill',
+              target: { strategy: 'placeholder', value: 'Password' },
+              value: 'validpass123',
+            };
+          }
+          if (obj1Call === 7) {
+            return {
+              thought: 'Submit valid login',
+              action: 'click',
+              target: { strategy: 'role', value: 'button', name: 'Sign In' },
+            };
+          }
+          if (obj1Call === 8) {
+            return {
+              thought: 'Assert dashboard is visible',
+              action: 'assertVisible',
+              target: { strategy: 'text', value: 'Welcome, Member!' },
+            };
+          }
+          return {
+            thought: 'Conclude login test passed',
+            action: 'conclude',
+            conclude: { outcome: 'PASS', reasoning: 'Valid and invalid authentication verified.' },
+          };
+        }
+
+        if (objective.id === 'obj-2-orders') {
+          obj2Call++;
+          if (obj2Call === 1) {
+            return {
+              thought: 'Assert order history link in authenticated dashboard',
+              action: 'assertVisible',
+              target: { strategy: 'text', value: 'My Order History' },
+            };
+          }
+          return {
+            thought: 'Conclude order history verified',
+            action: 'conclude',
+            conclude: { outcome: 'PASS', reasoning: 'Order history is accessible in authenticated session.' },
+          };
+        }
+      };
+
+      const report = await executeAiAgent(
+        {
+          url: `${baseUrl}/login-test-portal`,
+          instructions: 'Test login page with valid and invalid credentials, then inspect order history.',
+          credentials: { username: 'validuser', password: 'validpass123' },
+        },
+        {
+          allowLocalForTesting: true,
+          allowMock: true,
+          mockObjectives,
+          mockSteps,
+        }
+      );
+
+      assert.equal(report.status, 'passed');
+      assert.equal(report.failedSteps, 0);
+      assert.equal(report.skippedSteps, 0);
+      assert.ok(report.passedSteps >= 2);
+
+      // Verify both objectives are marked PASS
+      const obj1Steps = report.steps.filter((s) => s.objectiveId === 'obj-1-login');
+      const obj2Steps = report.steps.filter((s) => s.objectiveId === 'obj-2-orders');
+      assert.ok(obj1Steps.length > 0, 'Objective 1 steps must be present');
+      assert.ok(obj2Steps.length > 0, 'Objective 2 steps must be present');
+      assert.match(report.coverageAndLimitations.tested, /Verify login functionality/i);
+      assert.match(report.coverageAndLimitations.tested, /Inspect private member order history/i);
+    });
+
+    it('5. continues independent public objectives even when login verification fails', async () => {
+      const mockObjectives = [
+        {
+          id: 'obj-auth-fail',
+          description: 'Verify login functionality with valid credentials',
+          targetBehavior: 'Authentication check',
+          isAuthGate: true,
+        },
+        {
+          id: 'obj-dependent',
+          description: 'Inspect private account orders',
+          targetBehavior: 'Private orders check',
+          requiresAuth: true,
+          dependsOn: ['obj-auth-fail'],
+        },
+        {
+          id: 'obj-independent-calendar',
+          description: 'Check whether the displayed weekday matches the calendar date',
+          targetBehavior: 'Calendar synchronization',
+          requiresAuth: false,
+        },
+      ];
+
+      const mockSteps = ({ objective, stepNumber }) => {
+        if (objective.id === 'obj-auth-fail') {
+          // Objective 1 fails: assert non-existent element
+          return {
+            thought: 'Assert non-existent login success banner to trigger failure',
+            action: 'assertVisible',
+            target: { strategy: 'text', value: 'NonExistentBanner_999' },
+          };
+        }
+        if (objective.id === 'obj-independent-calendar') {
+          if (stepNumber <= 3) {
+            return {
+              thought: 'Verify date synchronization independently',
+              action: 'assertDateSync',
+            };
+          }
+          return {
+            thought: 'Conclude calendar check',
+            action: 'conclude',
+            conclude: { outcome: 'PASS', reasoning: 'Calendar verified independently.' },
+          };
+        }
+      };
+
+      const report = await executeAiAgent(
+        {
+          url: `${baseUrl}/calendar-sync`,
+          instructions: 'Login, inspect orders, and check calendar date.',
+          credentials: { username: 'validuser', password: 'validpass123' },
+        },
+        {
+          allowLocalForTesting: true,
+          allowMock: true,
+          mockObjectives,
+          mockSteps,
+          stepTimeoutMs: 1000,
+        }
+      );
+
+      assert.equal(report.status, 'failed');
+      assert.equal(report.failedSteps, 1);
+      assert.equal(report.skippedSteps, 1);
+      assert.ok(report.passedSteps >= 1);
+
+      // obj-dependent must be SKIPPED
+      const skippedStep = report.steps.find((s) => s.objectiveId === 'obj-dependent');
+      assert.ok(skippedStep);
+      assert.equal(skippedStep.status, 'SKIPPED');
+
+      // obj-independent-calendar must PASS
+      const calendarStep = report.steps.find((s) => s.objectiveId === 'obj-independent-calendar');
+      assert.ok(calendarStep);
+      assert.equal(calendarStep.status, 'PASS');
     });
   });
 });

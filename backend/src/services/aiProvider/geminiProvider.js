@@ -43,6 +43,13 @@ Requirements:
 - Define expected outcomes based on reliable criteria.
 - Note any prerequisites (such as test credentials or existing data).
 - NEVER assume every website has login, search, or cart.
+- Authentication & Dependency Rules:
+  1. A login-verification objective tests the authentication mechanism itself (targetBehavior: "Verify login functionality"). A login-testing objective does NOT require an already authenticated session (requiresAuth: false).
+  2. If testing invalid login, use deliberately invalid credentials (e.g., "invalid_user", "wrong_password") to verify that access is denied.
+  3. Valid login testing requires provided test credentials.
+  4. When testing BOTH valid and invalid login, test invalid login first (to verify denial), then log in with valid credentials so the session remains in a valid authenticated state for subsequent objectives.
+  5. If subsequent objectives genuinely require an authenticated session (e.g. private profile, restricted order history), set "requiresAuth": true and specify "dependsOn": ["<login-objective-id>"].
+  6. Public features (such as public search, product browsing, or footer links) do NOT require an authenticated session unless the website strictly restricts them behind login.
 - Return ONLY valid JSON matching this schema:
 {
   "objectives": [
@@ -51,7 +58,9 @@ Requirements:
       "description": "Clear human-readable summary of what to test",
       "targetBehavior": "Specific feature or behavior being exercised",
       "expectedOutcome": "Concrete measurable outcome that proves success",
-      "preconditions": ["Optional prerequisites like test credentials"],
+      "preconditions": ["Optional prerequisites like test credentials or page state"],
+      "dependsOn": ["Optional list of prerequisite objective IDs"],
+      "requiresAuth": false,
       "safetyRestrictions": ["Prohibited actions like actual payment or data deletion"]
     }
   ]
@@ -193,7 +202,11 @@ Available Actions:
 Decision Rules:
 - Prioritize accessible roles, labels, and text over raw CSS classes.
 - If the objective requires verifying date/day synchronization and the page displays a calendar or day ribbon, choose "assertDateSync".
-- If the page requires login but no credentials are provided in the environment, conclude with "BLOCKED".
+- If testing invalid login: Fill username and password with deliberately invalid values (e.g., "invalid_user", "wrong_password"), submit, and verify that access is denied (error message, alert, or remaining on login page).
+- When testing valid login: Fill the login form with provided test credentials and submit.
+- When testing both valid and invalid login: First test invalid credentials and verify denial, then submit valid credentials to establish the authenticated session.
+- If the current objective requires an authenticated session and the page is currently unauthenticated or on a login page, perform login using the available valid credentials to establish the authenticated session before proceeding with the objective.
+- If a page requires login but no credentials are provided in the environment, conclude with "BLOCKED".
 - If an expected error message or validation did not appear when expected, conclude with "FAIL".
 - If all verification checks for the objective have succeeded, conclude with "PASS".
 - Do NOT repeat the exact same action if it already failed or produced no change.

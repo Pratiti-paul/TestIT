@@ -8,6 +8,7 @@ import {
 } from './aiProvider/index.js';
 import { observePage } from './pageObserver.js';
 import { verifyDateAndWeekdaySync } from './verifiers/dateVerifier.js';
+import { verifyAuthenticationSuccess } from './verifiers/authVerifier.js';
 
 /**
  * Autonomous AI QA Website Testing Agent
@@ -129,6 +130,7 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
   const failedObjectiveIds = new Set();
   let authFailed = false;
   let authSucceeded = false;
+  let sessionIsAuthenticated = false;
   let fatalError = null;
   let failureAnalysis = null;
   let blockedReason = null;
@@ -229,20 +231,66 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
       });
 
       if (!depCheck.canRun) {
+        const isBlocked = depCheck.status === 'BLOCKED';
+        const stepStatus = isBlocked ? 'BLOCKED' : 'SKIPPED';
         executionSteps.push({
           stepIndex: currentStepIndex++,
           objectiveId: objId,
-          action: 'skip',
-          description: `Skip objective: ${objective.description}`,
-          status: 'SKIPPED',
+          action: isBlocked ? 'blocked' : 'skip',
+          description: `${isBlocked ? 'Blocked' : 'Skip'} objective: ${objective.description}`,
+          status: stepStatus,
           durationMs: 0,
-          expected: objective.expectedOutcome || 'Step skipped due to unfulfilled dependency',
+          expected: objective.expectedOutcome || (isBlocked ? 'Valid test credentials provided' : 'Step skipped due to unfulfilled dependency'),
           actual: depCheck.reason,
           screenshot: null,
         });
-        objectiveOutcomes.set(objId, 'SKIPPED');
+        objectiveOutcomes.set(objId, stepStatus);
         failedObjectiveIds.add(objId);
+        if (isBlocked && !blockedReason) {
+          blockedReason = depCheck.reason;
+        }
         continue;
+      }
+
+      // If this objective requires an authenticated session and the browser is not currently authenticated
+      // (e.g. after invalid-login testing), restore the authenticated session using valid credentials
+      if (
+        requiresAuthenticatedSession(objective) &&
+        !sessionIsAuthenticated &&
+        credentials?.username &&
+        credentials?.password &&
+        page &&
+        !page.isClosed()
+      ) {
+        const restored = await restoreAuthenticatedSession(
+          page,
+          credentials,
+          currentStepIndex++,
+          objId,
+          executionSteps,
+          stepTimeout,
+          options
+        );
+        if (restored) {
+          sessionIsAuthenticated = true;
+          authSucceeded = true;
+          authFailed = false;
+        } else {
+          executionSteps.push({
+            stepIndex: currentStepIndex++,
+            objectiveId: objId,
+            action: 'skip',
+            description: `Skip objective: ${objective.description}`,
+            status: 'SKIPPED',
+            durationMs: 0,
+            expected: 'Active authenticated session restored',
+            actual: 'Skipped: Failed to restore valid authenticated session using supplied credentials.',
+            screenshot: null,
+          });
+          objectiveOutcomes.set(objId, 'SKIPPED');
+          failedObjectiveIds.add(objId);
+          continue;
+        }
       }
 
       // Action loop tracking for loop detection within this objective
@@ -499,18 +547,52 @@ export async function executeAiAgent({ url, instructions, credentials = {} }, op
       }
 
       // Check if this objective was testing authentication
-      const isAuthObjective =
-        objective.isAuthGate === true ||
-        (objective.targetBehavior && /login|auth/i.test(objective.targetBehavior)) ||
-        (objective.description && /login|sign\s*in|authenticate/i.test(objective.description));
+      const isAuthObjective = isLoginVerificationObjective(objective);
 
       if (isAuthObjective) {
+        const testsValid = requiresValidCredentials(objective);
+
         if (objectiveOutcome === 'PASS') {
-          authSucceeded = true;
-          authFailed = false;
+          if (testsValid) {
+            // Verify with real browser evidence that authentication actually succeeded
+            if (page && !page.isClosed()) {
+              const authEvidence = await verifyAuthenticationSuccess(page, {
+                submittedUsername: credentials?.username,
+                preLoginUrl: trimmedUrl,
+              });
+
+              if (authEvidence.pass) {
+                authSucceeded = true;
+                sessionIsAuthenticated = true;
+                authFailed = false;
+              } else {
+                authFailed = true;
+                authSucceeded = false;
+                sessionIsAuthenticated = false;
+                objectiveOutcome = 'FAIL';
+                objectiveFailure = {
+                  description: `Authentication verification failed: ${authEvidence.actual}`,
+                  hypothesis:
+                    'Application did not establish an active session (no URL transition, session token, or user indicator observed).',
+                };
+                objectiveOutcomes.set(objId, 'FAIL');
+                failedObjectiveIds.add(objId);
+              }
+            } else {
+              authFailed = true;
+              authSucceeded = false;
+              sessionIsAuthenticated = false;
+            }
+          } else {
+            // Invalid-only login verification passed (access was denied as expected)
+            // Session remains unauthenticated
+            authFailed = false;
+            sessionIsAuthenticated = false;
+          }
         } else {
           authFailed = true;
           authSucceeded = false;
+          sessionIsAuthenticated = false;
         }
       }
 
@@ -697,11 +779,54 @@ async function executeAgentAction(page, decision, timeout, context) {
 
     case 'fill': {
       const locator = await resolveAgentLocator(page, target, timeout);
-      // Mask password if filling a secret
-      const isPassword = target.value.toLowerCase().includes('password') || (target.name && target.name.includes('password'));
-      const textToFill = isPassword && context.credentials?.password ? context.credentials.password : String(value || '');
+      const isPassword =
+        target.value.toLowerCase().includes('password') ||
+        (target.name && target.name.toLowerCase().includes('password')) ||
+        (target.strategy === 'role' && target.value === 'textbox' && target.name && target.name.toLowerCase().includes('password'));
+
+      const rawVal = String(value !== undefined && value !== null ? value : '');
+      const isDeliberateInvalidPassword =
+        isPassword &&
+        rawVal &&
+        (
+          /invalid|wrong|incorrect|bad|fake|test_wrong|fail/i.test(rawVal) ||
+          (context.credentials?.password && rawVal !== context.credentials.password && rawVal !== '••••••••' && rawVal !== '[VALID_PASSWORD]')
+        );
+
+      let textToFill;
+      let displayValue;
+
+      if (isPassword) {
+        if (isDeliberateInvalidPassword) {
+          textToFill = rawVal;
+          displayValue = '•••••••• (invalid test password)';
+        } else {
+          textToFill = context.credentials?.password || rawVal;
+          displayValue = '••••••••';
+        }
+      } else {
+        const isUsername =
+          target.value.toLowerCase().includes('user') ||
+          target.value.toLowerCase().includes('email') ||
+          target.value.toLowerCase().includes('login') ||
+          (target.name && /user|email|login/i.test(target.name));
+
+        const isDeliberateInvalidUsername =
+          isUsername &&
+          rawVal &&
+          /invalid|wrong|incorrect|bad|fake|test_wrong|fail/i.test(rawVal);
+
+        if (isUsername && !isDeliberateInvalidUsername && context.credentials?.username && (!rawVal || rawVal === '[VALID_USERNAME]')) {
+          textToFill = context.credentials.username;
+          displayValue = `"${context.credentials.username}"`;
+        } else {
+          textToFill = rawVal;
+          displayValue = `"${rawVal}"`;
+        }
+      }
+
       await locator.fill(textToFill, { timeout });
-      return { actual: `Filled input with ${isPassword ? '••••••••' : `"${value}"`}` };
+      return { actual: `Filled input with ${displayValue}` };
     }
 
     case 'select': {
@@ -817,6 +942,158 @@ async function resolveAgentLocator(page, target, timeout) {
 }
 
 /**
+ * Determines whether an objective tests/verifies login or authentication.
+ *
+ * @param {object} objective
+ * @returns {boolean}
+ */
+export function isLoginVerificationObjective(objective) {
+  if (!objective || typeof objective !== 'object') return false;
+  if (objective.isAuthGate === true) return true;
+
+  const text = `${objective.targetBehavior || ''} ${objective.description || ''}`.toLowerCase();
+  const isAuthTerm = /\b(log\s*in|sign\s*in|authenticate|authentication|auth\s*flow|login\s*page)\b/i.test(text);
+  const isTestingTerm = /\b(verify|test|check|attempt|validate|exercise|assert)\b/i.test(text);
+
+  return isAuthTerm && (isTestingTerm || text.includes('credential'));
+}
+
+/**
+ * Checks whether an objective requires valid test credentials to test successful authentication.
+ *
+ * @param {object} objective
+ * @returns {boolean}
+ */
+export function requiresValidCredentials(objective) {
+  if (!objective || typeof objective !== 'object') return false;
+  if (!isLoginVerificationObjective(objective)) return false;
+
+  if (objective.requiresCredentials === true) return true;
+
+  const text = `${objective.targetBehavior || ''} ${objective.description || ''} ${objective.expectedOutcome || ''}`.toLowerCase();
+  const preconds = Array.isArray(objective.preconditions) ? objective.preconditions.map(String).join(' ').toLowerCase() : '';
+
+  // Specifically check for valid credentials requirements
+  const specifiesValid =
+    /\b(valid\s*credential|valid\s*login|valid\s*and\s*invalid|valid\s*&\s*invalid|log\s*in\s*with\s*valid|sign\s*in\s*with\s*valid|using\s*valid)\b/i.test(text) ||
+    /\b(valid\s*credential|valid\s*login|test\s*credential|account\s*credential)\b/i.test(preconds);
+
+  if (specifiesValid) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Checks whether an objective requires an already-authenticated, active session.
+ * Login verification objectives NEVER require an existing authenticated session.
+ *
+ * @param {object} objective
+ * @returns {boolean}
+ */
+export function requiresAuthenticatedSession(objective) {
+  if (!objective || typeof objective !== 'object') return false;
+  if (isLoginVerificationObjective(objective)) return false;
+
+  if (objective.requiresAuth === true) return true;
+
+  if (Array.isArray(objective.preconditions)) {
+    return objective.preconditions.some((p) => {
+      const pLower = String(p).toLowerCase();
+      return (
+        pLower.includes('logged in') ||
+        pLower.includes('authenticated session') ||
+        pLower.includes('active session') ||
+        pLower.includes('authenticated user') ||
+        pLower.includes('user is authenticated') ||
+        pLower.includes('must be logged in') ||
+        pLower.includes('existing session')
+      );
+    });
+  }
+
+  return false;
+}
+
+/**
+ * Restores a valid authenticated session if an objective requires auth
+ * and the active browser session was left unauthenticated (e.g. after invalid-login testing).
+ */
+export async function restoreAuthenticatedSession(page, credentials, stepIndex, objId, executionSteps, timeout) {
+  if (!page || page.isClosed()) return false;
+  const startMs = Date.now();
+
+  try {
+    // Check if the current page has a visible login form
+    let hasLoginForm = await page.evaluate(() => {
+      const passInputs = Array.from(document.querySelectorAll('input[type="password"]')).filter(
+        (i) => i.offsetWidth > 0 && i.offsetHeight > 0
+      );
+      return passInputs.length > 0;
+    });
+
+    // If not, see if there is a login link or button to navigate to the login form
+    if (!hasLoginForm) {
+      const loginLink = page.locator('a[href*="login" i], a[href*="signin" i], a:has-text("Sign in"), a:has-text("Log in"), button:has-text("Sign in"), button:has-text("Log in")').first();
+      const linkVisible = await loginLink.isVisible().catch(() => false);
+      if (linkVisible) {
+        await loginLink.click({ timeout: 3000 }).catch(() => {});
+        await page.waitForTimeout(400);
+        await page.waitForLoadState('domcontentloaded').catch(() => {});
+      }
+    }
+
+    // Locate username and password inputs
+    const passInput = page.locator('input[type="password"]').first();
+    const isPassVisible = await passInput.isVisible({ timeout: 2000 }).catch(() => false);
+    if (!isPassVisible) return false;
+
+    const userInput = page.locator('input[type="email"], input[type="text"][name*="user" i], input[type="text"][name*="email" i], input[name*="user" i], input[name*="email" i], input[id*="user" i], input[id*="email" i], input:not([type="password"]):not([type="hidden"])').first();
+    const isUserVisible = await userInput.isVisible({ timeout: 2000 }).catch(() => false);
+    if (!isUserVisible) return false;
+
+    // Fill valid credentials
+    await userInput.fill(credentials.username, { timeout: 3000 });
+    await passInput.fill(credentials.password, { timeout: 3000 });
+
+    // Submit form
+    const submitBtn = page.locator('button[type="submit"], input[type="submit"], button:has-text("Sign in"), button:has-text("Log in"), button:has-text("Login")').first();
+    const hasBtn = await submitBtn.isVisible().catch(() => false);
+    if (hasBtn) {
+      await submitBtn.click({ timeout: 3000 });
+    } else {
+      await passInput.press('Enter', { timeout: 3000 });
+    }
+
+    // Verify authentication via multi-signal verifier
+    const authEvidence = await verifyAuthenticationSuccess(page, {
+      submittedUsername: credentials.username,
+      timeout: 4000,
+    });
+
+    if (authEvidence.pass) {
+      executionSteps.push({
+        stepIndex,
+        objectiveId: objId,
+        action: 'restoreSession',
+        description: 'Restore valid authenticated session using supplied test credentials',
+        status: 'PASS',
+        durationMs: Date.now() - startMs,
+        expected: 'Active authenticated session established in browser',
+        actual: 'Successfully restored authenticated session using valid credentials',
+        screenshot: null,
+      });
+      return true;
+    }
+
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Evaluates whether an objective can execute or must be skipped due to unfulfilled prerequisites.
  *
  * @param {object} objective
@@ -825,7 +1102,7 @@ async function resolveAgentLocator(page, target, timeout) {
  * @param {boolean} state.authFailed
  * @param {boolean} state.authSucceeded
  * @param {object} state.credentials
- * @returns {{ canRun: boolean, reason?: string }}
+ * @returns {{ canRun: boolean, status?: 'SKIPPED' | 'BLOCKED', reason?: string }}
  */
 export function checkObjectiveDependencies(objective, { failedObjectiveIds, authFailed, authSucceeded, credentials }) {
   if (!objective || typeof objective !== 'object') {
@@ -843,6 +1120,7 @@ export function checkObjectiveDependencies(objective, { failedObjectiveIds, auth
     if (failedObjectiveIds.has(depId)) {
       return {
         canRun: false,
+        status: 'SKIPPED',
         reason: `Skipped: Prerequisite objective "${depId}" failed or was not satisfied.`,
       };
     }
@@ -854,30 +1132,39 @@ export function checkObjectiveDependencies(objective, { failedObjectiveIds, auth
       if (typeof p === 'string' && failedObjectiveIds.has(p)) {
         return {
           canRun: false,
+          status: 'SKIPPED',
           reason: `Skipped: Prerequisite objective "${p}" failed or was not satisfied.`,
         };
       }
     }
   }
 
-  // 3. Authentication prerequisites
-  const requiresAuth =
-    objective.requiresAuth === true ||
-    (Array.isArray(objective.preconditions) &&
-      objective.preconditions.some((p) => {
-        const pLower = String(p).toLowerCase();
-        return (
-          pLower.includes('auth') ||
-          pLower.includes('login') ||
-          pLower.includes('credential') ||
-          pLower.includes('logged in')
-        );
-      }));
+  // 3. Login verification objective handling
+  if (isLoginVerificationObjective(objective)) {
+    // A login-verification objective is EXECUTABLE without an existing authenticated session.
+    // It must NEVER be misclassified as requiring an existing session.
+    const needsValidCreds = requiresValidCredentials(objective);
+    const hasValidCreds = Boolean(credentials?.username && credentials?.password);
+
+    if (needsValidCreds && !hasValidCreds) {
+      return {
+        canRun: false,
+        status: 'BLOCKED',
+        reason: 'Blocked: Testing valid login requires test credentials (username and password), but none were provided.',
+      };
+    }
+
+    return { canRun: true };
+  }
+
+  // 4. Authenticated non-login objectives
+  const requiresAuth = requiresAuthenticatedSession(objective);
 
   if (requiresAuth) {
     if (authFailed) {
       return {
         canRun: false,
+        status: 'SKIPPED',
         reason: 'Skipped: Requires an authenticated session, but earlier authentication verification failed.',
       };
     }
@@ -885,6 +1172,7 @@ export function checkObjectiveDependencies(objective, { failedObjectiveIds, auth
     if (!credentials?.username && !credentials?.password && !authSucceeded) {
       return {
         canRun: false,
+        status: 'SKIPPED',
         reason: 'Skipped: Requires an authenticated session, but no test account credentials were provided.',
       };
     }

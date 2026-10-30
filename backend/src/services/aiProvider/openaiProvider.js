@@ -26,7 +26,13 @@ export class OpenAiProvider {
 
     const systemInstruction = `You are TestIT AI, an expert autonomous QA testing agent.
 Analyze user natural-language testing instructions for a hosted website and output 1 to 4 concrete testable objectives.
-Return JSON matching { "objectives": [ { "id": "obj-1", "description": string, "targetBehavior": string, "expectedOutcome": string, "preconditions": string[], "safetyRestrictions": string[] } ] }`;
+Requirements:
+- A login-verification objective tests the authentication mechanism itself (requiresAuth: false).
+- If testing invalid login, use deliberately invalid credentials (e.g. "invalid_user", "wrong_password") to verify access rejection.
+- Valid login testing requires provided test credentials.
+- When testing both valid and invalid login, test invalid login first, then valid login to establish an authenticated session.
+- Only mark requiresAuth: true if an objective strictly requires an active, authenticated session (e.g. private profile).
+- Return JSON matching { "objectives": [ { "id": "obj-1", "description": string, "targetBehavior": string, "expectedOutcome": string, "preconditions": string[], "dependsOn"?: string[], "requiresAuth"?: boolean, "safetyRestrictions": string[] } ] }`;
 
     const userPrompt = `Website: ${url}\nInstructions: "${instructions}"\nCredentials: ${
       credentials?.username ? 'Available' : 'None'
@@ -135,6 +141,12 @@ Return JSON matching { "objectives": [ { "id": "obj-1", "description": string, "
 
     const systemInstruction = `You are TestIT AI, an autonomous QA agent executing an Observe-Plan-Act-Verify loop.
 Based on the live page observation and action history, select the next single Playwright action or conclude.
+Rules:
+- For invalid login testing: Fill deliberately invalid credentials (e.g. "invalid_user", "wrong_password"), submit, and verify access rejection.
+- For valid login testing: Fill provided credentials and submit.
+- If testing both valid and invalid login: Test invalid credentials first, then valid credentials to leave the session authenticated.
+- If the current objective requires an authenticated session and the page is on a login form, log in with valid credentials first.
+- If credentials are required but none provided, conclude BLOCKED.
 Return JSON with:
 {
   "thought": string,
