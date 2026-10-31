@@ -7,24 +7,6 @@
 
 ---
 
-## Table of Contents
-
-- [Overview](#-overview)
-- [Problem Statement](#-problem-statement)
-- [Our Solution](#-our-solution)
-- [Key Features](#-key-features)
-- [How It Works](#-how-it-works)
-- [Technology Stack](#-technology-stack)
-- [System Architecture](#-system-architecture)
-- [Getting Started](#-getting-started)
-- [Environment Variables](#-environment-variables)
-- [API Endpoints](#-api-endpoints)
-- [Security Considerations](#-security-considerations)
-- [Future Scope](#-future-scope)
-- [Contributing](#-contributing)
-
----
-
 ## Overview
 
 Website testing is an essential part of software development, but traditional testing often requires technical knowledge, predefined test cases, and repetitive manual effort.
