@@ -1,12 +1,31 @@
 import { useState } from 'react';
+import { Routes, Route } from 'react-router-dom';
 import { Header } from './components/Header';
 import { AiTestForm } from './components/AiTestForm';
-import { HowItWorks } from './components/HowItWorks';
 import { AiTestResults } from './components/AiTestResults';
+import { HowItWorksPage } from './components/HowItWorksPage';
 import { executeAiTest } from './services/api';
 import './App.css';
 
 const CURRENT_YEAR = new Date().getFullYear();
+
+function HomePage({ onRunAiTest, isRunning, testError, testReport }) {
+  return (
+    <>
+      <AiTestForm
+        onRunTest={onRunAiTest}
+        isRunning={isRunning}
+        apiError={testError}
+      />
+
+      {testReport && (
+        <div className={`results-container ${isRunning ? 'results-dimmed' : ''}`}>
+          <AiTestResults report={testReport} />
+        </div>
+      )}
+    </>
+  );
+}
 
 function App() {
   const [testReport, setTestReport] = useState(null);
@@ -27,31 +46,36 @@ function App() {
     }
   };
 
-  const scrollToHowItWorks = () => {
-    const el = document.getElementById('how-it-works');
-    if (el) {
-      el.scrollIntoView({ behavior: 'smooth', block: 'start' });
-    }
-  };
-
   return (
     <div className="testit-app">
-      <Header onNavigateHowItWorks={scrollToHowItWorks} />
+      <Header />
 
       <main className="main-content">
-        <AiTestForm
-          onRunTest={handleRunAiTest}
-          isRunning={isRunning}
-          apiError={testError}
-        />
-
-        <HowItWorks />
-
-        {testReport && (
-          <div className={`results-container ${isRunning ? 'results-dimmed' : ''}`}>
-            <AiTestResults report={testReport} />
-          </div>
-        )}
+        <Routes>
+          <Route
+            path="/"
+            element={
+              <HomePage
+                onRunAiTest={handleRunAiTest}
+                isRunning={isRunning}
+                testError={testError}
+                testReport={testReport}
+              />
+            }
+          />
+          <Route path="/how-it-works" element={<HowItWorksPage />} />
+          <Route
+            path="*"
+            element={
+              <HomePage
+                onRunAiTest={handleRunAiTest}
+                isRunning={isRunning}
+                testError={testError}
+                testReport={testReport}
+              />
+            }
+          />
+        </Routes>
       </main>
 
       <footer className="app-footer">
