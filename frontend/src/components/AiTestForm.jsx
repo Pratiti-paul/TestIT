@@ -60,8 +60,7 @@ export function AiTestForm({ onRunTest, isRunning, apiError }) {
   return (
     <section className="scan-form-section" aria-labelledby="ai-test-heading">
       <div className="section-intro">
-        <h1 id="ai-test-heading">AI-Driven Website Testing</h1>
-        <p className="intro-text">
+        <p className="ai-test-description">
           Enter any website URL and describe what to test in plain English. The AI analyzes your
           goals, plans the user journey, interacts with real page controls using Playwright, and
           verifies the actual outcomes.

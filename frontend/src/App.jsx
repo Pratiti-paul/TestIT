@@ -12,6 +12,16 @@ const CURRENT_YEAR = new Date().getFullYear();
 function HomePage({ onRunAiTest, isRunning, testError, testReport }) {
   return (
     <>
+      <section className="hero-statement-section" aria-label="Tagline">
+        <h1 className="hero-statement-title">
+          <span className="hero-statement-line">Every click tested.</span>
+          <span className="hero-statement-italic">Every experience trusted.</span>
+        </h1>
+        <p className="hero-statement-subtitle">
+          The autonomous AI that turns plain English goals into real browser interactions and verified outcomes in every web app.
+        </p>
+      </section>
+
       <AiTestForm
         onRunTest={onRunAiTest}
         isRunning={isRunning}
