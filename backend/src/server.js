@@ -5,7 +5,7 @@ import app from './app.js';
 
 const PORT = parseInt(process.env.PORT, 10) || 5001;
 
-const server = app.listen(PORT, () => {
+const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`TestIT backend server running on http://localhost:${PORT}`);
   console.log(`Health check endpoint: http://localhost:${PORT}/api/health`);
 });
