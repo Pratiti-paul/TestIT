@@ -19,4 +19,25 @@ server.on('error', (error) => {
   process.exit(1);
 });
 
+// Graceful shutdown on nodemon restart signal (SIGUSR2)
+// Ensures the TCP server closes and frees port 5001 before nodemon restarts
+process.once('SIGUSR2', () => {
+  server.close(() => {
+    process.kill(process.pid, 'SIGUSR2');
+  });
+});
+
+// Graceful shutdown on process termination (SIGINT, SIGTERM)
+process.on('SIGINT', () => {
+  server.close(() => {
+    process.exit(0);
+  });
+});
+
+process.on('SIGTERM', () => {
+  server.close(() => {
+    process.exit(0);
+  });
+});
+
 export default server;
