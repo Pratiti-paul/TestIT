@@ -1,0 +1,30 @@
+# Dependencies and package caches
+node_modules
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Secrets and environment files
+.env
+.env.*
+!.env.example
+
+# Test files and test logs
+test
+
+# Local development tooling and logs
+nodemon.json
+*.log
+.DS_Store
+Icon?
+Thumbs.db
+
+# Version control
+.git
+.gitignore
+
+# Docker metadata
+Dockerfile
+.dockerignore
+

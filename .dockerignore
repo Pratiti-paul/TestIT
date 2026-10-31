@@ -1,0 +1,33 @@
+# Dependencies
+node_modules
+**/node_modules
+
+# Secrets and environment files
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+
+# Frontend build artifacts
+frontend/dist
+
+# Tests and dev tools
+backend/test
+frontend/test
+backend/nodemon.json
+
+# Logs and OS files
+*.log
+**/*.log
+.DS_Store
+**/.DS_Store
+Icon?
+
+# Version control
+.git
+.gitignore
+**/Dockerfile
+**/.dockerignore
+
