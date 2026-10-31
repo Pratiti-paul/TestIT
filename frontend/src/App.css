@@ -16,18 +16,19 @@
   gap: 32px;
 }
 
-/* Header */
+/* Header (Plain Component) */
 .app-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 16px 24px;
-  background: var(--cream-card);
-  border: 1px solid var(--cream-border);
-  border-radius: 12px;
-  margin-top: 20px;
-  margin-bottom: 32px;
-  box-shadow: 0 2px 6px rgba(44, 36, 30, 0.03);
+  padding: 24px 0 20px 0;
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid var(--cream-border);
+  border-radius: 0;
+  margin-top: 0;
+  margin-bottom: 36px;
+  box-shadow: none;
   position: relative;
 }
 
@@ -334,13 +335,13 @@
   transform: translateY(-1px);
 }
 
-/* Form Section */
+/* Form Section (Plain Component) */
 .scan-form-section {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  padding: 32px;
-  box-shadow: var(--shadow);
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  padding: 0;
+  box-shadow: none;
 }
 
 .section-intro h1 {
@@ -376,12 +377,19 @@
   padding: 12px 16px;
   font-size: 16px;
   font-family: var(--sans);
-  background: var(--bg);
+  background: var(--surface);
   color: var(--text-h);
   border: 1px solid var(--border);
   border-radius: 8px;
   outline: none;
   transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.url-input::placeholder,
+.instructions-textarea::placeholder {
+  color: #8C7E72;
+  opacity: 0.75;
+  font-weight: 400;
 }
 
 .url-input:focus {
@@ -1141,7 +1149,7 @@
   }
 
   .scan-form-section {
-    padding: 20px;
+    padding: 0;
   }
 
   .input-wrapper {
@@ -1219,8 +1227,8 @@
 
 @media (max-width: 640px) {
   .app-header {
-    padding: 12px 16px;
-    margin-top: 12px;
+    padding: 16px 0;
+    margin-top: 0;
   }
 
   .header-left {
@@ -2129,7 +2137,7 @@
   border-radius: 8px;
   border: 1px solid var(--border);
   padding: 12px 16px;
-  background: var(--bg);
+  background: var(--surface);
   color: var(--text-h);
 }
 
@@ -2139,9 +2147,9 @@
 }
 
 .credentials-drawer-wrapper {
-  background: var(--code-bg);
+  background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: 8px;
   padding: 12px 16px;
 }
 
