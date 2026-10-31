@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { Header } from './components/Header';
 import { AiTestForm } from './components/AiTestForm';
+import { HowItWorks } from './components/HowItWorks';
 import { AiTestResults } from './components/AiTestResults';
 import { executeAiTest } from './services/api';
 import './App.css';
@@ -26,9 +27,16 @@ function App() {
     }
   };
 
+  const scrollToHowItWorks = () => {
+    const el = document.getElementById('how-it-works');
+    if (el) {
+      el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+  };
+
   return (
     <div className="testit-app">
-      <Header />
+      <Header onNavigateHowItWorks={scrollToHowItWorks} />
 
       <main className="main-content">
         <AiTestForm
@@ -36,6 +44,8 @@ function App() {
           isRunning={isRunning}
           apiError={testError}
         />
+
+        <HowItWorks />
 
         {testReport && (
           <div className={`results-container ${isRunning ? 'results-dimmed' : ''}`}>
@@ -45,7 +55,14 @@ function App() {
       </main>
 
       <footer className="app-footer">
-        <p>TestIT &copy; {CURRENT_YEAR} &mdash; AI-Driven Automated Website Testing</p>
+        <div className="footer-content">
+          <p className="footer-brand">
+            <strong>TestIT</strong> &mdash; Universal AI-Driven Automated Website Testing
+          </p>
+          <p className="footer-copyright">
+            &copy; {CURRENT_YEAR} TestIT Platform. All rights reserved.
+          </p>
+        </div>
       </footer>
     </div>
   );

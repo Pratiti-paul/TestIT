@@ -3,7 +3,7 @@ import { Sparkles, Loader2, AlertCircle, ShieldCheck, KeyRound, ChevronDown, Che
 import { validateClientUrl } from '../utils/urlHelpers';
 
 const SAMPLE_INSTRUCTIONS =
-  'Test the login page with valid and invalid credentials. Then search for Paracetamol, add the first result to the cart, and verify that the correct medicine, quantity, and total price appear.';
+  'Test the login page with valid and invalid credentials. Sort products by price, add an item to the cart, and verify that the cart and checkout details update correctly.';
 
 /**
  * AiTestForm
@@ -15,7 +15,7 @@ const SAMPLE_INSTRUCTIONS =
  * 4. Optional secure credentials drawer and authorization confirmation
  */
 export function AiTestForm({ onRunTest, isRunning, apiError }) {
-  const [url, setUrl] = useState('https://medico-sooty-omega.vercel.app/');
+  const [url, setUrl] = useState('https://www.saucedemo.com/');
   const [instructions, setInstructions] = useState(SAMPLE_INSTRUCTIONS);
   const [showCredentials, setShowCredentials] = useState(false);
   const [username, setUsername] = useState('');
