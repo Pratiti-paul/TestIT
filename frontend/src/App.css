@@ -24,7 +24,6 @@
   padding: 16px 24px;
   background: var(--cream-card);
   border: 1px solid var(--cream-border);
-  border-top: 3px solid #7C3AED;
   border-radius: 12px;
   margin-top: 20px;
   margin-bottom: 32px;
@@ -86,45 +85,10 @@
   background: rgba(255, 147, 62, 0.12);
 }
 
-/* Header Right: Documentation + Divider + Profile */
+/* Header Right: Profile */
 .header-right {
   display: flex;
   align-items: center;
-  gap: 14px;
-}
-
-.header-doc-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  padding: 7px 14px;
-  font-size: 13.5px;
-  font-weight: 500;
-  font-family: var(--sans);
-  color: #2C241E;
-  background: #FFFDF8;
-  border: 1px solid var(--cream-border);
-  border-radius: 8px;
-  cursor: pointer;
-  transition: all 0.15s ease;
-  box-shadow: 0 1px 2px rgba(44, 36, 30, 0.04);
-}
-
-.header-doc-btn:hover {
-  background: var(--cream-highlight);
-  border-color: var(--golden-yellow-border);
-  color: #1E232A;
-}
-
-.header-doc-btn .doc-icon {
-  color: #5A4E45;
-}
-
-.header-vertical-divider {
-  width: 1px;
-  height: 20px;
-  background: var(--cream-border);
-  margin: 0 2px;
 }
 
 .profile-container {
@@ -1270,18 +1234,6 @@
   .header-nav-link {
     font-size: 13px;
     padding: 4px 8px;
-  }
-
-  .header-right {
-    gap: 8px;
-  }
-
-  .header-doc-btn {
-    padding: 6px 10px;
-  }
-
-  .header-doc-btn span {
-    display: none;
   }
 }
 

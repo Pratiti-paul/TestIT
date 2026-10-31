@@ -1,11 +1,10 @@
 import { useState, useRef, useEffect } from 'react';
 import { Link, NavLink, useNavigate } from 'react-router-dom';
-import { User, LogIn, UserPlus, X, BookOpen, HelpCircle } from 'lucide-react';
+import { User, LogIn, UserPlus, X, HelpCircle } from 'lucide-react';
 
 export function Header() {
   const [profileDropdownOpen, setProfileDropdownOpen] = useState(false);
   const [authDialogState, setAuthDialogState] = useState({ isOpen: false, mode: 'login' });
-  const [docDialogOpen, setDocDialogOpen] = useState(false);
   const profileMenuRef = useRef(null);
   const navigate = useNavigate();
 
@@ -23,9 +22,6 @@ export function Header() {
         if (authDialogState.isOpen) {
           setAuthDialogState({ isOpen: false, mode: 'login' });
         }
-        if (docDialogOpen) {
-          setDocDialogOpen(false);
-        }
       }
     }
 
@@ -35,7 +31,7 @@ export function Header() {
       document.removeEventListener('mousedown', handleClickOutside);
       document.removeEventListener('keydown', handleKeyDown);
     };
-  }, [authDialogState.isOpen, docDialogOpen]);
+  }, [authDialogState.isOpen]);
 
   const handleOpenAuth = (mode) => {
     setProfileDropdownOpen(false);
@@ -70,20 +66,8 @@ export function Header() {
           </nav>
         </div>
 
-        {/* Right Side: Documentation + Vertical Divider + Circular Profile */}
+        {/* Right Side: Circular Profile Button */}
         <div className="header-right">
-          <button
-            type="button"
-            className="header-doc-btn"
-            onClick={() => setDocDialogOpen(true)}
-            aria-label="Documentation"
-          >
-            <BookOpen size={16} className="doc-icon" aria-hidden="true" />
-            <span>Documentation</span>
-          </button>
-
-          <div className="header-vertical-divider" aria-hidden="true" />
-
           <div className="profile-container" ref={profileMenuRef}>
             <button
               type="button"
@@ -128,61 +112,6 @@ export function Header() {
           </div>
         </div>
       </header>
-
-      {/* Documentation Preview Dialog */}
-      {docDialogOpen && (
-        <div
-          className="auth-modal-overlay"
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="doc-dialog-title"
-        >
-          <div className="auth-dialog-container">
-            <button
-              type="button"
-              className="auth-dialog-close-btn"
-              onClick={() => setDocDialogOpen(false)}
-              aria-label="Close dialog"
-            >
-              <X size={18} />
-            </button>
-
-            <div className="auth-dialog-head">
-              <div className="auth-dialog-icon-circle doc-circle">
-                <BookOpen size={22} />
-              </div>
-              <h2 id="doc-dialog-title" className="auth-dialog-heading">
-                Documentation & Guides
-              </h2>
-            </div>
-
-            <div className="auth-dialog-content">
-              <div className="auth-preview-badge doc-badge">
-                <span>Developer Preview</span>
-              </div>
-              <p className="auth-dialog-text">
-                Comprehensive testing recipes, Playwright locator recovery guides, and AI provider integration manuals are currently being prepared for the upcoming public release.
-              </p>
-              <div className="auth-dialog-card-callout">
-                <HelpCircle size={18} className="callout-icon" aria-hidden="true" />
-                <p>
-                  <strong>Autonomous AI Testing:</strong> You can run autonomous tests on any public or staging web application right now on the main page without setup.
-                </p>
-              </div>
-            </div>
-
-            <div className="auth-dialog-actions">
-              <button
-                type="button"
-                className="auth-dialog-start-btn"
-                onClick={() => setDocDialogOpen(false)}
-              >
-                Got it
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
 
       {/* Auth Preview Notice Modal (Honoring "Do not create fake authentication") */}
       {authDialogState.isOpen && (
